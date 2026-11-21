@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: gatherflow_test
+          POSTGRES_USER: gatherflow
+          POSTGRES_PASSWORD: gatherflow_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gatherflow -d gatherflow_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - name: Validate Flyway migrations on PostgreSQL
+        run: |
+          docker run --rm --network host \
+            -v "$GITHUB_WORKSPACE/migrations:/flyway/sql:ro" \
+            -e FLYWAY_URL=jdbc:postgresql://127.0.0.1:5432/gatherflow_test \
+            -e FLYWAY_USER=gatherflow \
+            -e FLYWAY_PASSWORD=gatherflow_test \
+            -e FLYWAY_LOCATIONS=filesystem:/flyway/sql \
+            flyway/flyway:11-alpine \
+            -baselineOnMigrate=true -baselineVersion=2 -validateMigrationNaming=true migrate
+      - name: Run unit, frontend, and PostgreSQL end-to-end tests
+        env:
+          GATHERFLOW_E2E_DATABASE_URL: postgresql://gatherflow:gatherflow_test@127.0.0.1:5432/gatherflow_test
+        run: npm test

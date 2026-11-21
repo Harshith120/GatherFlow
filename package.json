@@ -1,0 +1,27 @@
+{
+  "name": "gatherflow",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Event registration and attendee management",
+  "scripts": {
+    "start": "node scripts/migrate.js && node server.js",
+    "serve": "node server.js",
+    "db:migrate": "node scripts/migrate.js",
+    "test": "node --test",
+    "test:frontend": "node --test ./frontend.test.js",
+    "test:postgres-e2e": "node --test ./postgres.e2e.test.js"
+  },
+  "dependencies": {
+    "@zxing/browser": "^0.2.1",
+    "pg": "^8.16.3",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0",
+    "pg-mem": "^3.0.5"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}

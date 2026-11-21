@@ -1,0 +1,149 @@
+# GatherFlow
+
+GatherFlow is a PostgreSQL-backed event registration and attendee-management
+app. The browser UI is plain JavaScript, and the same-origin Node.js REST API
+uses PostgreSQL for durable records, `pg` for database access, and `qrcode` to
+create individual attendee tickets.
+
+## Run locally
+
+Requirements for local development: Node.js 22.13 or newer and PostgreSQL 15 or
+newer. To run migrations, install either Flyway CLI 11 with Java 21 and
+PostgreSQL support on `PATH`, or Docker Desktop and keep it running. The
+migration script prefers Flyway CLI and falls back to the official Flyway 11
+container when only Docker is available.
+
+Set the connection settings in PowerShell, install dependencies, and start the
+app:
+
+```powershell
+$env:PGHOST = "localhost"
+$env:PGPORT = "5432"
+$env:PGUSER = "gatherflow"
+$env:PGPASSWORD = "your-local-database-password"
+$env:PGDATABASE = "gatherflow"
+npm.cmd ci
+npm.cmd start
+```
+
+`npm.cmd start` applies Flyway migrations from `migrations/` and then starts the
+API. To apply migrations without starting the app, run
+`npm.cmd run db:migrate`. On Windows, if neither Flyway CLI nor Docker is
+available, install one of them and reopen PowerShell before running the command
+again. Starting `node .\server.js` directly skips migration execution and
+requires the database to already be at the latest Flyway version.
+On Windows, Docker Desktop may need WSL 2. If its engine cannot start, run
+`wsl --install` from an Administrator PowerShell, restart Windows when prompted,
+and launch Docker Desktop before migrating.
+Run tests with `npm.cmd test`. The API and frontend interaction tests use an
+in-memory PostgreSQL-compatible database. The end-to-end PostgreSQL test is
+enabled by setting `GATHERFLOW_E2E_DATABASE_URL` to a dedicated database whose
+name contains `test` or `e2e`; that database must already have the Flyway
+migrations applied. The test persists uniquely named organizer, event,
+registration, ticket, and check-in records, so never point it at a production
+or personal data database. CI migrates an isolated PostgreSQL test database
+and runs the complete suite against it. Run the browser-interaction suite alone
+with `npm.cmd run test:frontend` or the database-backed journey with
+`npm.cmd run test:postgres-e2e`.
+
+Flyway records applied versions in `flyway_schema_history`. Existing GatherFlow
+databases using the earlier `schema_migrations` table are baselined at version 2
+and upgraded by V3 without deleting registration data.
+
+Docker Compose starts PostgreSQL, runs Flyway migrations, and then starts
+GatherFlow. Set a local database password before running it:
+
+```powershell
+$env:POSTGRES_PASSWORD = "choose-a-local-password"
+docker compose up --build
+```
+
+If startup reports that PostgreSQL is unreachable, start the PostgreSQL service
+or use the Docker Compose command above. For a local PostgreSQL installation,
+set `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and `PGDATABASE` to a running
+database before starting GatherFlow. The app does not start without PostgreSQL.
+If startup reports `permission denied for schema public`, connect to the
+`gatherflow` database as a PostgreSQL administrator and grant the app role
+permission to create its migration tables:
+
+```sql
+GRANT USAGE, CREATE ON SCHEMA public TO gatherflow;
+```
+
+## Event and registration workflows
+
+- Organizers create draft events, edit event details, publish or unpublish
+  registration, close/reopen registration, mark events completed/cancelled,
+  and archive events without deleting registration history.
+- Events support registration windows, attendee capacity, PNG/JPEG/WebP banners,
+  custom required/optional text, choice and checkbox questions, repeat-email
+  rules, and registration cancellation settings.
+- Public visitors can browse published events, view event details, and register
+  without an account. Group forms collect a name, email, phone and answers for
+  each attendee.
+- Registration uses a PostgreSQL transaction and locks the event row while
+  checking capacity. Unique active email indexes enforce the configured
+  duplicate rule; cancelled registrations release their places.
+- Each attendee receives a unique QR image and ticket code. Each group receives
+  a separate unguessable confirmation code that can cancel the group before
+  the event starts when cancellation is enabled.
+- Organizers and assigned volunteers can scan QR tickets with a device camera,
+  search by attendee name, email, phone, registration ID, or ticket code, and
+  manually check in guests. Camera scanning requires HTTPS or localhost and
+  camera permission.
+- Attendee recovery searches existing registrations only; staff must confirm
+  identity before check-in. Invalid, cancelled, and duplicate tickets are
+  rejected. Check-ins record the timestamp, responsible user, method, and
+  recovery verification in the event audit history.
+- Organizers can view event statistics and registration answers and manage
+  assigned volunteers. Volunteer accounts can browse upcoming opportunities,
+  join or leave an event team, then access that event's attendee list and
+  check-in tools while assigned.
+- The organizer dashboard reports organization-scoped event, registration,
+  walk-in, arrival, and attendance totals, with recent registration/check-in
+  activity and a capacity comparison chart. It refreshes after workspace
+  operations and periodically while open.
+- Offline check-ins for already-loaded attendees queue in the browser and sync
+  when the connection returns; the synchronized action is also audited.
+
+## Database model
+
+Flyway migrations maintain normalized `organizations`,
+`organization_members`, `events`, `event_questions`, `registration_groups`,
+`attendees`, `registrations`, `tickets`, `check_ins`,
+`volunteer_assignments`, `audit_logs`, and password-reset tables. The upgrade
+migration copies existing event questions, attendee details, tickets,
+volunteer assignments, and check-in history before removing their legacy
+duplicate columns/tables.
+
+## Configuration and security
+
+`pg` uses the standard `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and
+`PGDATABASE` variables. Set `DATABASE_URL` instead when using a hosted database.
+Set a strong `JWT_SECRET` and `NODE_ENV=production` in production.
+The API is same-origin by default. If a separate web origin must call it, set
+`CORS_ALLOWED_ORIGINS` to a comma-separated allowlist of exact origins (for
+example, `https://events.example.com`, without paths or trailing slashes).
+Credentials are not enabled for cross-origin requests.
+
+Optional initial platform-administrator provisioning uses
+`PLATFORM_ADMIN_EMAIL` and `PLATFORM_ADMIN_PASSWORD` on first startup.
+Production password resets require:
+
+- `APP_BASE_URL`: the public HTTPS address of GatherFlow.
+- `RESET_EMAIL_ENDPOINT`: an HTTPS endpoint that accepts `to`, `subject`, and
+  `text` JSON and sends the email.
+- `RESET_EMAIL_TOKEN`: bearer credential for that endpoint.
+
+Production startup fails when its JWT signing key or reset-email configuration
+is missing. In development, reset links are returned to the local UI; reset
+tokens, email addresses, and passwords are not written to server logs.
+Authentication, public registration, and check-in routes have per-process IP
+rate limits; multi-instance deployments should use a shared rate-limit store.
+Put the app behind an HTTPS reverse proxy and keep database, signing-key,
+administrator, and email-endpoint credentials secret.
+
+Passwords are hashed with Node.js `scrypt`; signed sessions expire after eight
+hours. Reset links expire after 30 minutes and invalidate existing sessions.
+PostgreSQL stores event and registration data permanently; no data is stored
+in SQLite or browser storage other than the offline check-in queue.

@@ -1,0 +1,65 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: gatherflow
+      POSTGRES_USER: gatherflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your environment}
+    volumes:
+      - gatherflow-postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gatherflow -d gatherflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  flyway:
+    image: flyway/flyway:11-alpine
+    environment:
+      FLYWAY_URL: jdbc:postgresql://db:5432/gatherflow
+      FLYWAY_USER: gatherflow
+      FLYWAY_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your environment}
+      FLYWAY_LOCATIONS: filesystem:/flyway/sql
+    command:
+      - "-baselineOnMigrate=true"
+      - "-baselineVersion=2"
+      - "-validateMigrationNaming=true"
+      - "-connectRetries=10"
+      - "migrate"
+    volumes:
+      - ./migrations:/flyway/sql:ro
+    depends_on:
+      db:
+        condition: service_healthy
+  gatherflow:
+    build: .
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      PORT: "3000"
+      NODE_ENV: ${NODE_ENV:-development}
+      JWT_SECRET: ${JWT_SECRET:-}
+      PLATFORM_ADMIN_EMAIL: ${PLATFORM_ADMIN_EMAIL:-}
+      PLATFORM_ADMIN_PASSWORD: ${PLATFORM_ADMIN_PASSWORD:-}
+      APP_BASE_URL: ${APP_BASE_URL:-}
+      RESET_EMAIL_ENDPOINT: ${RESET_EMAIL_ENDPOINT:-}
+      RESET_EMAIL_TOKEN: ${RESET_EMAIL_TOKEN:-}
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: gatherflow
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your environment}
+      PGDATABASE: gatherflow
+    depends_on:
+      db:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  gatherflow-postgres:
