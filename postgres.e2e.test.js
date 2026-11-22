@@ -19,10 +19,13 @@ test("PostgreSQL end-to-end stores registrations and QR check-ins for the organi
 }, async t => {
   assertIsTestDatabase(databaseUrl);
   const pool = new Pool({ connectionString: databaseUrl, max: 3 });
+  const emails = [];
   const server = await createApp({
     pool,
     jwtSecret: "postgres-e2e-secret-with-sufficient-entropy",
-    resetLog: () => {}
+    resetLog: () => {},
+    emailDomainCheck: async () => true,
+    emailDelivery: async message => emails.push(message)
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
@@ -42,15 +45,22 @@ test("PostgreSQL end-to-end stores registrations and QR check-ins for the organi
     return data;
   }
 
+  async function createAccount(name, email, role = "ATTENDEE") {
+    const pending = await request("/api/auth/register", {
+      method: "POST",
+      body: { name, email, password: testPassword, role }
+    });
+    assert.equal(pending.verificationRequired, true);
+    const message = [...emails].reverse().find(item => item.to === email && item.purpose === "ACCOUNT_VERIFICATION");
+    const token = message?.text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
+    assert.ok(token);
+    await request("/api/auth/verify-email", { method: "POST", body: { token } });
+    return request("/api/auth/login", { method: "POST", body: { email, password: testPassword } });
+  }
+
   const unique = randomUUID();
-  const organizer = await request("/api/auth/register", {
-    method: "POST",
-    body: { name: "PostgreSQL Journey Organizer", email: `organizer-${unique}@example.test`, password: testPassword }
-  });
-  const volunteer = await request("/api/auth/register", {
-    method: "POST",
-    body: { name: "PostgreSQL Journey Volunteer", email: `volunteer-${unique}@example.test`, password: testPassword, role: "VOLUNTEER" }
-  });
+  const organizer = await createAccount("PostgreSQL Journey Organizer", `organizer-${unique}@example.test`, "ORGANIZER");
+  const volunteer = await createAccount("PostgreSQL Journey Volunteer", `volunteer-${unique}@example.test`, "VOLUNTEER");
   const event = (await request("/api/events", {
     method: "POST",
     token: organizer.token,
@@ -72,7 +82,7 @@ test("PostgreSQL end-to-end stores registrations and QR check-ins for the organi
     token: volunteer.token,
     body: {}
   });
-  const registration = await request(`/api/events/${event.id}/registrations`, {
+  const pendingRegistration = await request(`/api/events/${event.id}/registrations`, {
     method: "POST",
     body: {
       name: "PostgreSQL Journey Attendee",
@@ -80,6 +90,14 @@ test("PostgreSQL end-to-end stores registrations and QR check-ins for the organi
       phone: "555-0404",
       answers: {}
     }
+  });
+  assert.equal(pendingRegistration.verificationRequired, true);
+  const registrationEmail = [...emails].reverse().find(item => item.purpose === "EVENT_REGISTRATION_VERIFICATION");
+  const registrationToken = registrationEmail?.text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
+  assert.ok(registrationToken);
+  const registration = await request("/api/auth/verify-email", {
+    method: "POST",
+    body: { token: registrationToken }
   });
   const ticketCode = registration.registrations[0].ticket_code;
 

@@ -48,7 +48,7 @@ with `npm.cmd run test:frontend` or the database-backed journey with
 
 Flyway records applied versions in `flyway_schema_history`. Existing GatherFlow
 databases using the earlier `schema_migrations` table are baselined at version 2
-and upgraded by V3 without deleting registration data.
+and upgraded by V3 and V4 without deleting registration data.
 
 Docker Compose starts PostgreSQL, runs Flyway migrations, and then starts
 GatherFlow. Set a local database password before running it:
@@ -111,7 +111,8 @@ GRANT USAGE, CREATE ON SCHEMA public TO gatherflow;
 Flyway migrations maintain normalized `organizations`,
 `organization_members`, `events`, `event_questions`, `registration_groups`,
 `attendees`, `registrations`, `tickets`, `check_ins`,
-`volunteer_assignments`, `audit_logs`, and password-reset tables. The upgrade
+`volunteer_assignments`, `audit_logs`, email-verification tokens, and
+password-reset tables. The upgrade
 migration copies existing event questions, attendee details, tickets,
 volunteer assignments, and check-in history before removing their legacy
 duplicate columns/tables.
@@ -128,16 +129,38 @@ Credentials are not enabled for cross-origin requests.
 
 Optional initial platform-administrator provisioning uses
 `PLATFORM_ADMIN_EMAIL` and `PLATFORM_ADMIN_PASSWORD` on first startup.
-Production password resets require:
+Account signup, password resets, event registration confirmation, and volunteer
+notifications use the configured email delivery service. Production email
+delivery requires:
 
 - `APP_BASE_URL`: the public HTTPS address of GatherFlow.
-- `RESET_EMAIL_ENDPOINT`: an HTTPS endpoint that accepts `to`, `subject`, and
-  `text` JSON and sends the email.
-- `RESET_EMAIL_TOKEN`: bearer credential for that endpoint.
+- `EMAIL_DELIVERY_ENDPOINT`: an HTTPS endpoint that accepts `to`, `subject`,
+  and `text` JSON and sends the email.
+- `EMAIL_DELIVERY_TOKEN`: bearer credential for that endpoint.
 
-Production startup fails when its JWT signing key or reset-email configuration
-is missing. In development, reset links are returned to the local UI; reset
-tokens, email addresses, and passwords are not written to server logs.
+`RESET_EMAIL_ENDPOINT` and `RESET_EMAIL_TOKEN` remain supported as aliases for
+existing password-reset deployments. Configure the email provider's verified
+sender address/domain separately, including the SPF and DKIM DNS records
+required by that provider. GatherFlow validates that recipient domains have
+mail-routing DNS records, but this does not prove a specific mailbox exists or
+configure the sender. A one-time confirmation link proves mailbox control:
+accounts cannot sign in until confirmed, and public registrations are not
+created or ticketed until the primary contact confirms. Group guests' domains
+are checked too, but only the primary contact receives a confirmation link.
+Staff-recorded walk-ins bypass email verification.
+
+In development without an email endpoint, signup and registration responses
+expose verification links in the UI for local testing. In production, the app
+requires the email delivery configuration and does not expose verification or
+reset links in API responses. existing accounts created before email
+verification must request a new verification link before signing in. Account
+verification links are single-use and expire after 24 hours. Event registration
+links expire after one hour and can be reopened to retry ticket-email delivery
+without creating duplicate registrations. Tokens, email addresses, and
+passwords are not written to server logs.
+
+Production startup fails when its JWT signing key or email configuration is
+missing.
 Authentication, public registration, and check-in routes have per-process IP
 rate limits; multi-instance deployments should use a shared rate-limit store.
 Put the app behind an HTTPS reverse proxy and keep database, signing-key,

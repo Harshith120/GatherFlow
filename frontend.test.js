@@ -79,7 +79,7 @@ async function openPage(t, baseUrl, token = "", pageUrl = `${baseUrl}/`) {
     : token
       ? !window.document.querySelector("#appShell").classList.contains("hidden")
       : window.document.querySelector("#publicDirectoryList .empty-state, #publicDirectoryList [data-public-event]"));
-  if (token) await waitFor(() => window.document.querySelector("#eventCards .empty-state, #eventCards [data-status-event], #eventCards [data-join-volunteer]"));
+  if (token) await waitFor(() => window.document.querySelector("#eventCards .empty-state, #eventCards .event-card, #eventCards [data-status-event], #eventCards [data-join-volunteer]"));
   return window;
 }
 
@@ -132,7 +132,7 @@ async function registerAccountThroughUi(app, t, window, { name, email, role = "O
   setValue(window, '#authForm [name="password"]', password);
   submit(window, "#authForm");
   await waitFor(() => !window.document.querySelector("#appShell").classList.contains("hidden"));
-  await waitFor(() => window.document.querySelector("#eventCards .empty-state, #eventCards [data-status-event], #eventCards [data-join-volunteer]"));
+  await waitFor(() => window.document.querySelector("#eventCards .empty-state, #eventCards .event-card, #eventCards [data-status-event], #eventCards [data-join-volunteer]"));
   return window.localStorage.getItem("gatherflow.session");
 }
 
@@ -144,6 +144,8 @@ async function loginThroughUi(window, email, accountPassword = password) {
   setValue(window, '#authForm [name="email"]', email);
   setValue(window, '#authForm [name="password"]', accountPassword);
   submit(window, "#authForm");
+  await waitFor(() => !window.document.querySelector("#appShell").classList.contains("hidden"));
+  await waitFor(() => window.document.querySelector("#eventCards .empty-state, #eventCards .event-card, #eventCards [data-status-event], #eventCards [data-join-volunteer]"));
 }
 
 async function verifyThroughUi(t, app, verificationUrl) {
@@ -220,7 +222,7 @@ test("frontend login displays auth errors and opens the authenticated workspace"
   setValue(window, '#authForm [name="password"]', password);
   submit(window, "#authForm");
   await waitFor(() => !window.document.querySelector("#appShell").classList.contains("hidden"));
-  await waitFor(() => window.document.querySelector("#eventCards .empty-state, #eventCards [data-status-event], #eventCards [data-join-volunteer]"));
+  await waitFor(() => window.document.querySelector("#eventCards .empty-state, #eventCards .event-card, #eventCards [data-status-event], #eventCards [data-join-volunteer]"));
   assert.equal(window.document.querySelector("#profileName").textContent, "Login Organizer");
   assert.ok(window.localStorage.getItem("gatherflow.session"));
 });

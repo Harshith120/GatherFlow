@@ -429,7 +429,7 @@ async function verifyFlywayMigrations(pool) {
       SELECT version FROM flyway_schema_history
       WHERE success=TRUE ORDER BY installed_rank DESC LIMIT 1
     `);
-    if (result.rows[0]?.version !== "3") {
+    if (result.rows[0]?.version !== "4") {
       throw new Error("GatherFlow database migrations are incomplete. Run `npm.cmd run db:migrate` in PowerShell before starting the server.");
     }
   } catch (error) {
@@ -794,6 +794,9 @@ export async function createApp({
             await client.query("COMMIT");
           } catch (error) {
             await client.query("ROLLBACK");
+            if (error.code === "23505") {
+              fail(409, "An account with this email already exists. Sign in or request a verification link.");
+            }
             throw error;
           } finally {
             client.release();
@@ -847,18 +850,16 @@ export async function createApp({
             const user = found.rows[0];
             const client = await pool.connect();
             let token;
+            let tokenHash;
             try {
               await client.query("BEGIN");
-              await client.query(
-                "DELETE FROM email_verification_tokens WHERE user_id=$1 AND purpose='ACCOUNT'",
-                [user.id]
-              );
               token = await issueVerificationToken({
                 purpose: "ACCOUNT",
                 userId: user.id,
                 expiresInMs: 24 * 60 * 60 * 1000,
                 client
               });
+              tokenHash = createHmac("sha256", jwtSecret).update(token).digest("hex");
               await client.query("COMMIT");
             } catch (error) {
               await client.query("ROLLBACK");
@@ -875,9 +876,14 @@ export async function createApp({
                 text: `Hi ${user.name},\n\nConfirm this email address to activate your GatherFlow account:\n\n${verificationUrl}\n\nThis link expires in 24 hours.`
               });
             } catch (error) {
+              if (tokenHash) await pool.query("DELETE FROM email_verification_tokens WHERE token_hash=$1", [tokenHash]);
               console.error("Account verification email delivery failed:", error.message);
               fail(502, "The verification email could not be sent. Please try again later.");
             }
+            await pool.query(
+              "DELETE FROM email_verification_tokens WHERE user_id=$1 AND purpose='ACCOUNT' AND token_hash<>$2",
+              [user.id, tokenHash]
+            );
             if (process.env.NODE_ENV !== "production" && !emailDelivery && !emailEndpoint) {
               result.verificationUrl = new URL(verificationUrl).pathname + new URL(verificationUrl).search;
             }
@@ -1578,7 +1584,7 @@ export async function createApp({
           const email = normalizeEmail(body.email);
           await requireMailDomain(email, emailDomainCheck);
           const pending = await pool.query(`
-            SELECT token_hash FROM email_verification_tokens
+            SELECT * FROM email_verification_tokens
             WHERE purpose='EVENT_REGISTRATION' AND event_id=$1
               AND payload->>'email'=$2 AND expires_at>NOW()
             ORDER BY created_at DESC LIMIT 1
@@ -1589,10 +1595,21 @@ export async function createApp({
           if (pending.rowCount) {
             const rawToken = randomBytes(32).toString("base64url");
             const tokenHash = createHmac("sha256", jwtSecret).update(rawToken).digest("hex");
-            await pool.query(
-              "UPDATE email_verification_tokens SET token_hash=$1,created_at=NOW() WHERE token_hash=$2",
-              [tokenHash, pending.rows[0].token_hash]
-            );
+            const previousHash = pending.rows[0].token_hash;
+            await pool.query(`
+              INSERT INTO email_verification_tokens
+                (token_hash,purpose,user_id,event_id,payload,completed_group_id,completed_confirmation_code,expires_at)
+              VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8)
+            `, [
+              tokenHash,
+              pending.rows[0].purpose,
+              pending.rows[0].user_id,
+              pending.rows[0].event_id,
+              JSON.stringify(pending.rows[0].payload),
+              pending.rows[0].completed_group_id,
+              pending.rows[0].completed_confirmation_code,
+              pending.rows[0].expires_at
+            ]);
             const verificationUrl = makeVerificationUrl(rawToken);
             try {
               await sendEmail({
@@ -1602,9 +1619,11 @@ export async function createApp({
                 text: `Confirm this email address to finish your event registration:\n\n${verificationUrl}\n\nThis link expires in one hour.`
               });
             } catch (error) {
+              await pool.query("DELETE FROM email_verification_tokens WHERE token_hash=$1", [tokenHash]);
               console.error("Event registration verification email delivery failed:", error.message);
               fail(502, "The verification email could not be sent. Please try again later.");
             }
+            await pool.query("DELETE FROM email_verification_tokens WHERE token_hash=$1", [previousHash]);
             if (process.env.NODE_ENV !== "production" && !emailDelivery && !emailEndpoint) {
               result.verificationUrl = new URL(verificationUrl).pathname + new URL(verificationUrl).search;
             }

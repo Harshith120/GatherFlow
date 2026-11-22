@@ -142,6 +142,252 @@ test("authentication accepts valid credentials and protects account routes", asy
   assert.equal((await app.request("/api/auth/me", { token: "invalid.token.value" })).status, 401);
 });
 
+test("unverified accounts cannot sign in and a failed resend preserves the original link", async t => {
+  const messages = [];
+  let deliveryUnavailable = false;
+  const app = await setup(t, {
+    emailDelivery: async message => {
+      if (deliveryUnavailable) throw new Error("mail service unavailable");
+      messages.push(message);
+    }
+  });
+  const email = "pending-account@example.test";
+  const created = await app.request("/api/auth/register", {
+    method: "POST",
+    body: { name: "Pending Account", email, password: "A-secure-test-password-2026" }
+  });
+  assert.equal(created.status, 202);
+  const original = messages[0].text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
+  assert.ok(original);
+  assert.equal((await app.request("/api/auth/login", {
+    method: "POST",
+    body: { email, password: "A-secure-test-password-2026" }
+  })).status, 403);
+
+  deliveryUnavailable = true;
+  const resend = await app.request("/api/auth/resend-verification", {
+    method: "POST",
+    body: { email }
+  });
+  assert.equal(resend.status, 502);
+  deliveryUnavailable = false;
+
+  const verified = await app.request("/api/auth/verify-email", {
+    method: "POST",
+    body: { token: original }
+  });
+  assert.equal(verified.status, 200);
+  assert.equal(verified.data.verified, true);
+  assert.equal((await app.request("/api/auth/verify-email", {
+    method: "POST",
+    body: { token: original }
+  })).status, 400);
+  assert.equal((await app.request("/api/auth/login", {
+    method: "POST",
+    body: { email, password: "A-secure-test-password-2026" }
+  })).status, 200);
+});
+
+test("expired account verification links cannot activate an account", async t => {
+  const app = await setup(t);
+  const email = "expired-account@example.test";
+  await app.request("/api/auth/register", {
+    method: "POST",
+    body: { name: "Expired Account", email, password: "A-secure-test-password-2026" }
+  });
+  const token = app.emailMessages[0].text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
+  assert.ok(token);
+  const user = await app.pool.query("SELECT id FROM users WHERE email=$1", [email]);
+  await app.pool.query(
+    "UPDATE email_verification_tokens SET expires_at=$1 WHERE user_id=$2 AND purpose='ACCOUNT'",
+    [new Date(Date.now() - 1000), user.rows[0].id]
+  );
+  assert.equal((await app.request("/api/auth/verify-email", {
+    method: "POST",
+    body: { token }
+  })).status, 400);
+  assert.equal((await app.request("/api/auth/login", {
+    method: "POST",
+    body: { email, password: "A-secure-test-password-2026" }
+  })).status, 403);
+});
+
+test("email validation normalizes IDN domains and rejects malformed, undeliverable, or uncheckable domains", async t => {
+  const checkedDomains = [];
+  const app = await setup(t, {
+    emailDomainCheck: async domain => {
+      checkedDomains.push(domain);
+      if (domain === "temporary.example") throw new Error("DNS unavailable");
+      return domain !== "unroutable.example";
+    }
+  });
+  const malformed = await app.request("/api/auth/register", {
+    method: "POST",
+    body: { name: "Malformed Address", email: "bad..local@example.test", password: "A-secure-test-password-2026" }
+  });
+  assert.equal(malformed.status, 400);
+
+  const unroutable = await app.request("/api/auth/register", {
+    method: "POST",
+    body: { name: "Unroutable Address", email: "person@unroutable.example", password: "A-secure-test-password-2026" }
+  });
+  assert.equal(unroutable.status, 400);
+
+  const temporary = await app.request("/api/auth/register", {
+    method: "POST",
+    body: { name: "Temporary Address", email: "person@temporary.example", password: "A-secure-test-password-2026" }
+  });
+  assert.equal(temporary.status, 503);
+
+  const idn = await app.request("/api/auth/register", {
+    method: "POST",
+    body: { name: "IDN Address", email: "person@bücher.example", password: "A-secure-test-password-2026" }
+  });
+  assert.equal(idn.status, 202);
+  assert.ok(checkedDomains.includes("xn--bcher-kva.example"));
+  assert.equal(app.emailMessages.at(-1).to, "person@xn--bcher-kva.example");
+});
+
+test("public group registration checks every email domain while staff walk-ins bypass confirmation", async t => {
+  const domains = [];
+  const app = await setup(t, {
+    emailDomainCheck: async domain => {
+      domains.push(domain);
+      return domain !== "unroutable.example";
+    }
+  });
+  const organizer = await createUser(app, "Domain Test Organizer", "organizer@example.test");
+  const event = await createEvent(app, organizer.token);
+  await publish(app, organizer.token, event.id);
+
+  const rejectedGroup = await app.request(`/api/events/${event.id}/registrations`, {
+    method: "POST",
+    body: {
+      ...registration("Primary Contact", "primary@example.test"),
+      attendees: [registration("Group Guest", "guest@unroutable.example")]
+    }
+  });
+  assert.equal(rejectedGroup.status, 400);
+  assert.ok(domains.includes("example.test"));
+  assert.ok(domains.includes("unroutable.example"));
+  const pending = await app.pool.query(
+    "SELECT COUNT(*) AS count FROM email_verification_tokens WHERE purpose='EVENT_REGISTRATION' AND event_id=$1",
+    [event.id]
+  );
+  assert.equal(Number(pending.rows[0].count), 0);
+
+  const checksBeforeWalkIn = domains.length;
+  const walkIn = await app.request(`/api/events/${event.id}/registrations`, {
+    token: organizer.token,
+    method: "POST",
+    body: {
+      ...registration("Walk In", "walkin@unroutable.example"),
+      source: "WALK_IN"
+    }
+  });
+  assert.equal(walkIn.status, 201);
+  const source = await app.pool.query(
+    "SELECT registration_source FROM registrations WHERE id=$1",
+    [walkIn.data.registrations[0].id]
+  );
+  assert.equal(source.rows[0].registration_source, "WALK_IN");
+  assert.equal(domains.length, checksBeforeWalkIn);
+});
+
+test("failed event-registration resend preserves the previously delivered confirmation link", async t => {
+  const messages = [];
+  let deliveryUnavailable = false;
+  const app = await setup(t, {
+    emailDelivery: async message => {
+      if (deliveryUnavailable) throw new Error("mail service unavailable");
+      messages.push(message);
+    }
+  });
+  const organizerEmail = "resend-organizer@example.test";
+  await app.request("/api/auth/register", {
+    method: "POST",
+    body: { name: "Registration Resend Organizer", email: organizerEmail, password: "A-secure-test-password-2026", role: "ORGANIZER" }
+  });
+  const organizerToken = messages.find(message => message.to === organizerEmail && message.purpose === "ACCOUNT_VERIFICATION")
+    ?.text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
+  assert.ok(organizerToken);
+  await app.request("/api/auth/verify-email", { method: "POST", body: { token: organizerToken } });
+  const organizerLogin = await app.request("/api/auth/login", {
+    method: "POST",
+    body: { email: organizerEmail, password: "A-secure-test-password-2026" }
+  });
+  assert.equal(organizerLogin.status, 200);
+  const organizer = organizerLogin.data;
+  const event = await createEvent(app, organizer.token);
+  await publish(app, organizer.token, event.id);
+  const email = "resend-contact@example.test";
+  const pending = await app.request(`/api/events/${event.id}/registrations`, {
+    method: "POST",
+    body: registration("Resend Contact", email)
+  });
+  assert.equal(pending.status, 202);
+  const original = messages.find(message => message.to === email && message.purpose === "EVENT_REGISTRATION_VERIFICATION")
+    ?.text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
+  assert.ok(original);
+
+  deliveryUnavailable = true;
+  const resend = await app.request(`/api/events/${event.id}/registrations/resend-verification`, {
+    method: "POST",
+    body: { email }
+  });
+  assert.equal(resend.status, 502);
+  deliveryUnavailable = false;
+
+  const verified = await app.request("/api/auth/verify-email", {
+    method: "POST",
+    body: { token: original }
+  });
+  assert.equal(verified.status, 200);
+  assert.equal(verified.data.registrations.length, 1);
+});
+
+test("public registrations remain pending until email verification and link retries do not duplicate tickets", async t => {
+  const app = await setup(t);
+  const organizer = await createUser(app, "Pending Registration Organizer", "pending-organizer@example.test");
+  const event = await createEvent(app, organizer.token);
+  await publish(app, organizer.token, event.id);
+  const pending = await app.request(`/api/events/${event.id}/registrations`, {
+    method: "POST",
+    body: registration("Pending Attendee", "pending-attendee@example.test")
+  });
+  assert.equal(pending.status, 202);
+  const token = app.emailMessages.find(message =>
+    message.to === "pending-attendee@example.test" && message.purpose === "EVENT_REGISTRATION_VERIFICATION"
+  )?.text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
+  assert.ok(token);
+  const beforeVerification = await app.pool.query(`
+    SELECT COUNT(*) AS registrations FROM registrations WHERE event_id=$1
+  `, [event.id]);
+  assert.equal(Number(beforeVerification.rows[0].registrations), 0);
+
+  const firstConfirmation = await app.request("/api/auth/verify-email", {
+    method: "POST",
+    body: { token }
+  });
+  assert.equal(firstConfirmation.status, 200);
+  assert.equal(firstConfirmation.data.registrations.length, 1);
+  const retry = await app.request("/api/auth/verify-email", {
+    method: "POST",
+    body: { token }
+  });
+  assert.equal(retry.status, 200);
+  const persisted = await app.pool.query(`
+    SELECT COUNT(*) AS registrations FROM registrations WHERE event_id=$1
+  `, [event.id]);
+  const tickets = await app.pool.query(`
+    SELECT COUNT(*) AS tickets FROM tickets
+    JOIN registrations ON registrations.id=tickets.registration_id
+    WHERE registrations.event_id=$1
+  `, [event.id]);
+  assert.equal(Number(persisted.rows[0].registrations), 1);
+  assert.equal(Number(tickets.rows[0].tickets), 1);
+});
+
 test("published events collect validated group registrations with unique QR tickets", async t => {
   const app = await setup(t);
   const organizer = await createUser(app, "Morgan Organizer", "morgan@example.test");
@@ -755,6 +1001,7 @@ test("Flyway schema upgrade preserves and normalizes legacy registration data", 
     VALUES ($1,$2,$3,$4,'RECOVERY',TRUE)
   `, [auditId, eventId, registrationId, volunteerId]);
   await apply("V3__normalized_event_operations.sql");
+  await apply("V4__email_verification.sql");
 
   const event = await pool.query("SELECT organization_id FROM events WHERE id=$1", [eventId]);
   assert.equal(event.rows[0].organization_id, organizerId);
@@ -776,6 +1023,8 @@ test("Flyway schema upgrade preserves and normalizes legacy registration data", 
   assert.equal(audit.rows[0].action, "CHECK_IN");
   const source = await pool.query("SELECT registration_source FROM registrations WHERE id=$1", [registrationId]);
   assert.equal(source.rows[0].registration_source, "PUBLIC");
+  const legacyAccount = await pool.query("SELECT email_verified_at FROM users WHERE id=$1", [organizerId]);
+  assert.equal(legacyAccount.rows[0].email_verified_at, null);
   await pool.end();
 });
 
