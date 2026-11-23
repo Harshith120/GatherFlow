@@ -120,6 +120,12 @@ function fail(status, message) {
   throw error;
 }
 
+function escapeEmailHtml(value) {
+  return String(value).replace(/[&<>"']/g, character => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[character]);
+}
+
 function jsonResponse(response, status, value, headers = {}) {
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
@@ -580,6 +586,8 @@ export async function createApp({
   resetLog = message => console.info(message),
   resetDelivery = null,
   emailDelivery = null,
+  emailFetch = fetch,
+  emailErrorLog = message => console.error(message),
   emailDomainCheck = hasMailRecords,
   corsAllowedOrigins = process.env.CORS_ALLOWED_ORIGINS || "",
   skipMigrationCheck = false
@@ -588,9 +596,19 @@ export async function createApp({
   if (process.env.NODE_ENV === "production" && Buffer.byteLength(jwtSecret) < 32) throw new Error("JWT_SECRET must contain at least 32 bytes in production.");
   const emailEndpoint = process.env.EMAIL_DELIVERY_ENDPOINT || process.env.RESET_EMAIL_ENDPOINT;
   const emailToken = process.env.EMAIL_DELIVERY_TOKEN || process.env.RESET_EMAIL_TOKEN;
-  if (process.env.NODE_ENV === "production" && !emailDelivery && !resetDelivery &&
-    (!emailEndpoint || !emailToken || !process.env.APP_BASE_URL)) {
-    throw new Error("Production requires EMAIL_DELIVERY_ENDPOINT, EMAIL_DELIVERY_TOKEN, and APP_BASE_URL for transactional email.");
+  const resendApiKey = process.env.RESEND_API_KEY;
+  const resendFromEmail = process.env.RESEND_FROM_EMAIL;
+  const hasResendEmailDelivery = Boolean(resendApiKey && resendFromEmail);
+  const hasEmailDelivery = Boolean(emailDelivery || hasResendEmailDelivery || (emailEndpoint && emailToken));
+  if (process.env.NODE_ENV === "production" && (!hasEmailDelivery || !process.env.APP_BASE_URL)) {
+    throw new Error("Production requires transactional email delivery and APP_BASE_URL.");
+  }
+  if (!hasEmailDelivery) {
+    if (Boolean(resendApiKey) !== Boolean(resendFromEmail)) {
+      emailErrorLog("Resend email delivery is incomplete. Set both RESEND_API_KEY and RESEND_FROM_EMAIL.");
+    } else {
+      emailErrorLog("Email delivery is not configured. Set RESEND_API_KEY and RESEND_FROM_EMAIL, or configure EMAIL_DELIVERY_ENDPOINT and EMAIL_DELIVERY_TOKEN.");
+    }
   }
   if (process.env.NODE_ENV === "production") {
     if (emailEndpoint && new URL(emailEndpoint).protocol !== "https:") {
@@ -612,32 +630,139 @@ export async function createApp({
     throw error;
   }
 
-  async function sendEmail({ to, subject, text, purpose, resetUrl }) {
+  async function sendEmail({ to, subject, text, html, purpose, resetUrl }) {
     if (emailDelivery) {
-      await emailDelivery({ to, subject, text, purpose });
+      await emailDelivery({ to, subject, text, ...(html ? { html } : {}), purpose });
       return;
     }
     if (purpose === "PASSWORD_RESET" && resetDelivery) {
       await resetDelivery({ email: to, resetUrl });
       return;
     }
+    if (hasResendEmailDelivery) {
+      const delivery = await emailFetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${resendApiKey}`
+        },
+        body: JSON.stringify({
+          from: resendFromEmail,
+          to: [to],
+          subject,
+          text,
+          ...(html ? { html } : {})
+        }),
+        signal: AbortSignal.timeout(10000)
+      });
+      if (!delivery.ok) throw new Error(`Resend email delivery failed with HTTP ${delivery.status}.`);
+      return;
+    }
     if (emailEndpoint && emailToken) {
-      const delivery = await fetch(emailEndpoint, {
+      const delivery = await emailFetch(emailEndpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${emailToken}`
         },
-        body: JSON.stringify({ to, subject, text }),
+        body: JSON.stringify({ to, subject, text, ...(html ? { html } : {}) }),
         signal: AbortSignal.timeout(10000)
       });
       if (!delivery.ok) throw new Error(`Transactional email delivery failed with HTTP ${delivery.status}.`);
       return;
     }
-    if (process.env.NODE_ENV === "production") {
-      throw new Error("Transactional email delivery is not configured.");
-    }
-    resetLog(`Transactional email prepared for local development (${purpose}).`);
+    throw new Error("Email delivery is not configured; set RESEND_API_KEY and RESEND_FROM_EMAIL, or EMAIL_DELIVERY_ENDPOINT and EMAIL_DELIVERY_TOKEN.");
+  }
+
+  function sendEmailInBackground(message) {
+    setImmediate(() => {
+      sendEmail(message).catch(error => {
+        emailErrorLog(`${message.purpose} email delivery failed: ${error.message}`);
+      });
+    });
+  }
+
+  function notifyEventAttendeesInBackground(eventId, { subject, text }) {
+    setImmediate(async () => {
+      try {
+        const recipients = await pool.query(`
+          SELECT DISTINCT LOWER(a.email) AS email
+          FROM registrations r
+          JOIN attendees a ON a.id=r.attendee_profile_id
+          WHERE r.event_id=$1 AND r.status<>'CANCELLED'
+        `, [eventId]);
+        const results = await Promise.allSettled(recipients.rows.map(({ email }) =>
+          sendEmail({ to: email, subject, text, purpose: "EVENT_UPDATE" })
+        ));
+        const failures = results.filter(result => result.status === "rejected");
+        if (failures.length) {
+          const reason = failures[0].reason;
+          emailErrorLog(`Event update email delivery failed for ${failures.length} of ${results.length} recipients: ${reason.message}`);
+        }
+      } catch (error) {
+        emailErrorLog(`Event update email notifications could not be prepared: ${error.message}`);
+      }
+    });
+  }
+
+  function notifyVolunteerAssignmentInBackground(eventId, volunteer, notifyVolunteer = false) {
+    setImmediate(async () => {
+      try {
+        const event = await getVolunteerNotificationDetails(eventId);
+        if (!event) throw new Error("Event not found.");
+        const eventDate = new Date(event.starts_at).toISOString();
+        const details = `Volunteer: ${volunteer.name}\nEmail: ${volunteer.email}\nAssigned role: Volunteer\nEvent: ${event.title}\nDate and time: ${eventDate}`;
+        sendEmailInBackground({
+          to: event.organizer_email,
+          purpose: "VOLUNTEER_ASSIGNMENT",
+          subject: `Volunteer joined: ${event.title}`,
+          text: `A volunteer joined or was assigned to your event.\n\n${details}`
+        });
+        if (notifyVolunteer) {
+          sendEmailInBackground({
+            to: volunteer.email,
+            purpose: "VOLUNTEER_ASSIGNMENT",
+            subject: `You were added to an event team: ${event.title}`,
+            text: `Hi ${volunteer.name},\n\nYou are assigned as a Volunteer for ${event.title}.\nDate and time: ${eventDate}\n\nSign in to access the event check-in tools.`
+          });
+        }
+      } catch (error) {
+        emailErrorLog(`Volunteer assignment email notifications could not be prepared: ${error.message}`);
+      }
+    });
+  }
+
+  async function getVolunteerNotificationDetails(eventId) {
+    const result = await pool.query(`
+      SELECT e.title,e.starts_at,u.email AS organizer_email
+      FROM events e JOIN users u ON u.id=e.organizer_id
+      WHERE e.id=$1
+    `, [eventId]);
+    return result.rows[0];
+  }
+
+  function sendRegistrationConfirmationInBackground(to, event, registrationResult) {
+    const date = new Date(event.starts_at).toLocaleString("en-US", {
+      dateStyle: "long", timeStyle: "short", timeZone: "UTC"
+    });
+    const ticketText = registrationResult.registrations.map(item =>
+      `${item.name}: ${item.ticket_code}`
+    ).join("\n");
+    const ticketHtml = registrationResult.registrations.map(item => `
+      <li>
+        <p>${escapeEmailHtml(item.name)} — ticket code: <strong>${escapeEmailHtml(item.ticket_code)}</strong></p>
+        <img src="${item.qrCode}" alt="QR ticket for ${escapeEmailHtml(item.name)}" width="220" height="220" />
+      </li>`).join("");
+    sendEmailInBackground({
+      to,
+      purpose: "REGISTRATION_CONFIRMATION",
+      subject: `Registration confirmed: ${event.title}`,
+      text: `Your registration for ${event.title} is confirmed.\n\nDate and time: ${date} UTC\nVenue: ${event.location}\n\nConfirmation code: ${registrationResult.confirmationCode}\n\nTickets:\n${ticketText}\n\nEach ticket code is also encoded in its QR code.`,
+      html: `<h1>Registration confirmed: ${escapeEmailHtml(event.title)}</h1>
+        <p>Date and time: ${escapeEmailHtml(date)} UTC<br>Venue: ${escapeEmailHtml(event.location)}</p>
+        <p>Confirmation code: <strong>${escapeEmailHtml(registrationResult.confirmationCode)}</strong></p>
+        <h2>Your tickets</h2><ul>${ticketHtml}</ul>`
+    });
   }
 
   async function issueVerificationToken({
@@ -666,25 +791,12 @@ export async function createApp({
     }
     try {
       await requireMailDomain(email, emailDomainCheck);
-      const created = await pool.query(`
+      await pool.query(`
         INSERT INTO users (id,name,email,password_hash,role)
         VALUES ($1,$2,$3,$4,'PLATFORM_ADMIN')
         ON CONFLICT (email) DO NOTHING
         RETURNING id,email
       `, [randomUUID(), "Platform administrator", email, hashPassword(process.env.PLATFORM_ADMIN_PASSWORD)]);
-      if (created.rowCount) {
-        const verificationToken = await issueVerificationToken({
-          purpose: "ACCOUNT",
-          userId: created.rows[0].id,
-          expiresInMs: 24 * 60 * 60 * 1000
-        });
-        await sendEmail({
-          to: email,
-          purpose: "ACCOUNT_VERIFICATION",
-          subject: "Verify your GatherFlow administrator account",
-          text: `Confirm this email address to activate the GatherFlow administrator account:\n\n${makeVerificationUrl(verificationToken)}`
-        });
-      }
     } catch (error) {
       if (!suppliedPool) await pool.end();
       throw error;
@@ -730,7 +842,7 @@ export async function createApp({
         const claims = authHeader.startsWith("Bearer ") ? verifyToken(authHeader.slice(7), jwtSecret) : null;
         const signedInResult = claims ? await pool.query("SELECT * FROM users WHERE id = $1", [claims.sub]) : null;
         const signedInUser = signedInResult?.rows[0];
-        const current = signedInUser && claims.ver === signedInUser.token_version && signedInUser.email_verified_at
+        const current = signedInUser && claims.ver === signedInUser.token_version
           ? signedInUser
           : null;
         const requireUser = () => current || fail(401, "Please sign in to continue.");
@@ -775,7 +887,6 @@ export async function createApp({
           };
           const client = await pool.connect();
           let createdUser;
-          let verificationToken;
           try {
             await client.query("BEGIN");
             const result = await client.query(`
@@ -784,43 +895,20 @@ export async function createApp({
             `, [user.id, name, email, user.password_hash, role]);
             createdUser = result.rows[0];
             if (role === "ORGANIZER") await ensureOrganization(client, createdUser);
-            await client.query("DELETE FROM email_verification_tokens WHERE user_id=$1 AND purpose='ACCOUNT'", [user.id]);
-            verificationToken = await issueVerificationToken({
-              purpose: "ACCOUNT",
-              userId: user.id,
-              expiresInMs: 24 * 60 * 60 * 1000,
-              client
-            });
             await client.query("COMMIT");
           } catch (error) {
             await client.query("ROLLBACK");
             if (error.code === "23505") {
-              fail(409, "An account with this email already exists. Sign in or request a verification link.");
+              fail(409, "An account with this email already exists. Sign in instead.");
             }
             throw error;
           } finally {
             client.release();
           }
-          const verificationUrl = makeVerificationUrl(verificationToken);
-          try {
-            await sendEmail({
-              to: email,
-              purpose: "ACCOUNT_VERIFICATION",
-              subject: "Verify your GatherFlow account",
-              text: `Hi ${name},\n\nConfirm this email address to activate your GatherFlow account:\n\n${verificationUrl}\n\nThis link expires in 24 hours.`
-            });
-          } catch (error) {
-            console.error("Account verification email delivery failed:", error.message);
-            fail(502, "Your account was created, but the verification email could not be sent. Request a new link and try again.");
-          }
-          const result = {
-            verificationRequired: true,
-            message: `We sent a verification link to ${email}. Confirm your email before signing in.`
-          };
-          if (process.env.NODE_ENV !== "production" && !emailDelivery && !emailEndpoint) {
-            result.verificationUrl = new URL(verificationUrl).pathname + new URL(verificationUrl).search;
-          }
-          return jsonResponse(response, 202, result);
+          return jsonResponse(response, 201, {
+            token: makeToken(createdUser, jwtSecret),
+            user: userView(createdUser)
+          });
         }
 
         if (method === "POST" && url.pathname === "/api/auth/login") {
@@ -830,9 +918,6 @@ export async function createApp({
           const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
           const user = result.rows[0];
           if (!user || !checkPassword(password, user.password_hash)) fail(401, "Email or password is incorrect.");
-          if (!user.email_verified_at) {
-            fail(403, "Verify your email address before signing in. Request a new verification link to continue.");
-          }
           return jsonResponse(response, 200, { token: makeToken(user, jwtSecret), user: userView(user) });
         }
 
@@ -988,17 +1073,12 @@ export async function createApp({
             ...row,
             qrCode: await QRCode.toDataURL(row.ticket_code, { errorCorrectionLevel: "M", margin: 1, width: 220 })
           })));
-          try {
-            await sendEmail({
-              to: contactEmail,
-              purpose: "REGISTRATION_CONFIRMATION",
-              subject: `Registration confirmed: ${eventTitle}`,
-              text: `Your registration for ${eventTitle} is confirmed.\n\nConfirmation code: ${registrationResult.confirmationCode}\n\n${registrationResult.registrations.map(item => `${item.name}: ${item.ticket_code}`).join("\n")}\n\nEach attendee should bring their ticket code or QR ticket.`
-            });
-          } catch (error) {
-            console.error("Registration confirmation email delivery failed:", error.message);
-            fail(502, "Your registration is confirmed, but the ticket email could not be sent. Reopen the verification link to retry delivery.");
-          }
+          sendEmailInBackground({
+            to: contactEmail,
+            purpose: "REGISTRATION_CONFIRMATION",
+            subject: `Registration confirmed: ${eventTitle}`,
+            text: `Your registration for ${eventTitle} is confirmed.\n\nConfirmation code: ${registrationResult.confirmationCode}\n\n${registrationResult.registrations.map(item => `${item.name}: ${item.ticket_code}`).join("\n")}\n\nEach attendee should bring their ticket code or QR ticket.`
+          });
           return jsonResponse(response, 200, {
             verified: true,
             kind: "EVENT_REGISTRATION",
@@ -1015,7 +1095,7 @@ export async function createApp({
             fail(503, "Password reset is temporarily unavailable. Please contact your event administrator.");
           }
           const email = normalizeEmail(body.email);
-          const result = await pool.query("SELECT * FROM users WHERE email = $1 AND email_verified_at IS NOT NULL", [email]);
+          const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
           const user = result.rows[0];
           let resetUrl;
           if (user) {
@@ -1025,18 +1105,22 @@ export async function createApp({
             await pool.query("INSERT INTO password_resets (token_hash,user_id,expires_at) VALUES ($1,$2,$3)",
               [tokenHash, user.id, new Date(Date.now() + 30 * 60 * 1000)]);
             resetUrl = new URL(`/reset-password?token=${encodeURIComponent(token)}`, appBaseUrl).toString();
-            try {
-              await sendEmail({
-                to: email,
-                purpose: "PASSWORD_RESET",
-                resetUrl,
-                subject: "Reset your GatherFlow password",
-                text: `Use this link within 30 minutes to reset your GatherFlow password:\n\n${resetUrl}`
-              });
-            } catch (error) {
-              await pool.query("DELETE FROM password_resets WHERE user_id = $1", [user.id]);
-              console.error("Password reset delivery failed:", error.message);
-              fail(502, "Password reset delivery failed. Please try again later.");
+            if (process.env.NODE_ENV !== "production" && !hasEmailDelivery && !resetDelivery) {
+              resetLog("Password reset email was not sent: configure email delivery to enable outbound mail. A local reset link is available in the response.");
+            } else {
+              try {
+                await sendEmail({
+                  to: email,
+                  purpose: "PASSWORD_RESET",
+                  resetUrl,
+                  subject: "Reset your GatherFlow password",
+                  text: `Use this link within 30 minutes to reset your GatherFlow password:\n\n${resetUrl}`
+                });
+              } catch (error) {
+                await pool.query("DELETE FROM password_resets WHERE user_id = $1", [user.id]);
+                console.error("Password reset delivery failed:", error.message);
+                fail(502, "Password reset delivery failed. Please try again later.");
+              }
             }
           }
           const resultBody = { message: "If an account exists for that email, a reset link has been created." };
@@ -1285,6 +1369,7 @@ export async function createApp({
           requireRole("PLATFORM_ADMIN", "ORGANIZER");
           const client = await pool.connect();
           let eventId;
+          let cancelled = false;
           try {
             await client.query("BEGIN");
             const result = await client.query("SELECT * FROM events WHERE id=$1 AND archived_at IS NULL FOR UPDATE", [statusPath[1]]);
@@ -1292,6 +1377,7 @@ export async function createApp({
             if (!event) fail(404, "Event not found.");
             const status = String(body.status || "");
             setEventStatus(event, status);
+            cancelled = status === "CANCELLED";
             await client.query("UPDATE events SET status=$1,updated_at=NOW() WHERE id=$2", [status, event.id]);
             await writeAuditLog(client, {
               eventId: event.id,
@@ -1310,6 +1396,12 @@ export async function createApp({
             client.release();
           }
           const withStats = await getEvent(pool, eventId);
+          if (cancelled) {
+            notifyEventAttendeesInBackground(eventId, {
+              subject: `Event cancelled: ${withStats.title}`,
+              text: `We’re sorry, but ${withStats.title} has been cancelled.\n\nScheduled date and time: ${new Date(withStats.starts_at).toISOString()}\nVenue: ${withStats.location}\n\nPlease contact the event organizer if you have questions.`
+            });
+          }
           return jsonResponse(response, 200, { event: eventView(withStats) });
         }
 
@@ -1366,18 +1458,7 @@ export async function createApp({
               client.release();
             }
             if (joined.rowCount) {
-              const eventName = await pool.query("SELECT title FROM events WHERE id=$1", [volunteerPath[1]]);
-              try {
-                await sendEmail({
-                  to: user.email,
-                  purpose: "VOLUNTEER_ASSIGNMENT",
-                  subject: "You joined an event team on GatherFlow",
-                  text: `You are now a volunteer for ${eventName.rows[0]?.title || "a GatherFlow event"}. Sign in to view your volunteer check-in tools.`
-                });
-              } catch (error) {
-                console.error("Volunteer notification delivery failed:", error.message);
-                fail(502, "You joined the event team, but the notification email could not be sent.");
-              }
+              notifyVolunteerAssignmentInBackground(volunteerPath[1], user);
             }
             return jsonResponse(response, joined.rowCount ? 201 : 200, {
               joined: true,
@@ -1389,14 +1470,11 @@ export async function createApp({
           const email = normalizeEmail(body.email, "Enter a valid volunteer email address.");
           await requireMailDomain(email, emailDomainCheck);
           const volunteer = await pool.query(
-            "SELECT id,role,name,email,email_verified_at FROM users WHERE email=$1",
+            "SELECT id,role,name,email FROM users WHERE email=$1",
             [email]
           );
           if (!volunteer.rowCount || volunteer.rows[0].role !== "VOLUNTEER") {
             fail(404, "Create a volunteer account before adding them to an event.");
-          }
-          if (!volunteer.rows[0].email_verified_at) {
-            fail(409, "The volunteer must verify their email address before being assigned.");
           }
           const client = await pool.connect();
           let added;
@@ -1424,19 +1502,7 @@ export async function createApp({
             client.release();
           }
           if (added.rowCount) {
-            const eventTitleResult = await pool.query("SELECT title FROM events WHERE id=$1", [volunteerPath[1]]);
-            const eventTitle = eventTitleResult.rows[0]?.title || "a GatherFlow event";
-            try {
-              await sendEmail({
-                to: volunteer.rows[0].email,
-                purpose: "VOLUNTEER_ASSIGNMENT",
-                subject: "You were added to an event team on GatherFlow",
-                text: `Hi ${volunteer.rows[0].name},\n\nYou were added as a volunteer for ${eventTitle}. Sign in to access the check-in tools.`
-              });
-            } catch (error) {
-              console.error("Volunteer notification delivery failed:", error.message);
-              fail(502, "The volunteer was assigned, but the notification email could not be sent.");
-            }
+            notifyVolunteerAssignmentInBackground(volunteerPath[1], volunteer.rows[0], true);
           }
           return jsonResponse(response, added.rowCount ? 201 : 200, { added: Boolean(added.rowCount) });
         }
@@ -1637,7 +1703,13 @@ export async function createApp({
           const isStaffWalkIn = body.source === "WALK_IN" &&
             ["ORGANIZER", "PLATFORM_ADMIN"].includes(current?.role);
           if (isStaffWalkIn) {
+            const walkInContact = validatePerson(body);
+            const eventResult = await pool.query(`
+              SELECT title,starts_at,location,allow_cancellations
+              FROM events WHERE id=$1 AND archived_at IS NULL
+            `, [eventId]);
             const result = await registerPeople(pool, eventId, body, current, appBaseUrl);
+            sendRegistrationConfirmationInBackground(walkInContact.email, eventResult.rows[0], result);
             return jsonResponse(response, 201, result);
           }
 
@@ -1653,47 +1725,14 @@ export async function createApp({
 
           const event = eventView(await getEvent(pool, eventId));
           if (!event.canRegister) fail(409, "Registration for this event is not currently available.");
-          if (people.length > event.capacity - event.registered) {
-            fail(409, "There are not enough remaining places for this group.");
-          }
-          const questions = await getEventQuestions(pool, eventId);
-          validateAnswers(body.answers || {}, questions);
-          for (const guest of guests) validateAnswers(guest.answers || {}, questions);
-          const payload = { ...body, email: lead.email, attendees: guests };
-          const token = randomBytes(32).toString("base64url");
-          const tokenHash = createHmac("sha256", jwtSecret).update(token).digest("hex");
-          await pool.query("DELETE FROM email_verification_tokens WHERE expires_at<=NOW()");
-          await pool.query(`
-            INSERT INTO email_verification_tokens (token_hash,purpose,user_id,event_id,payload,expires_at)
-            VALUES ($1,'EVENT_REGISTRATION',$2,$3,$4::jsonb,$5)
-          `, [
-            tokenHash,
-            current?.role === "ATTENDEE" ? current.id : null,
-            eventId,
-            JSON.stringify(payload),
-            new Date(Date.now() + 60 * 60 * 1000)
-          ]);
-          const verificationUrl = makeVerificationUrl(token);
-          try {
-            await sendEmail({
-              to: lead.email,
-              purpose: "EVENT_REGISTRATION_VERIFICATION",
-              subject: "Confirm your event registration",
-              text: `Confirm this email address to finish your registration for ${event.title}:\n\n${verificationUrl}\n\nThis link expires in one hour.`
-            });
-          } catch (error) {
-            await pool.query("DELETE FROM email_verification_tokens WHERE token_hash=$1", [tokenHash]);
-            console.error("Event registration verification email delivery failed:", error.message);
-            fail(502, "Your registration was not completed because the verification email could not be sent. Please try again.");
-          }
-          const result = {
-            verificationRequired: true,
-            message: `We sent a verification link to ${lead.email}. Your registration and tickets will be confirmed after you verify.`
-          };
-          if (process.env.NODE_ENV !== "production" && !emailDelivery && !emailEndpoint) {
-            result.verificationUrl = new URL(verificationUrl).pathname + new URL(verificationUrl).search;
-          }
-          return jsonResponse(response, 202, result);
+          const result = await registerPeople(pool, eventId, body, current, appBaseUrl);
+          sendRegistrationConfirmationInBackground(lead.email, event, result);
+          return jsonResponse(response, 201, {
+            ...result,
+            eventTitle: event.title,
+            allowCancellations: event.allow_cancellations,
+            message: "Registration complete. Your ticket confirmation will be sent by email."
+          });
         }
 
         const cancelPath = url.pathname.match(/^\/api\/registrations\/([0-9a-f]+)\/cancel$/i);
@@ -1753,6 +1792,7 @@ export async function createApp({
           requireRole("PLATFORM_ADMIN", "ORGANIZER");
           const client = await pool.connect();
           let updatedEventId;
+          let importantDetailsChanged = false;
           try {
             await client.query("BEGIN");
             const result = await client.query(
@@ -1785,6 +1825,9 @@ export async function createApp({
             if (registrationEnd && Date.parse(registrationEnd) > Date.parse(startsAt)) fail(400, "Registration must close before the event starts.");
             const active = await client.query("SELECT COUNT(*) AS count FROM registrations WHERE event_id=$1 AND status <> 'CANCELLED'", [eventIdPath[1]]);
             if (capacity < Number(active.rows[0].count)) fail(409, "Capacity cannot be lower than the number of active registrations.");
+            importantDetailsChanged =
+              new Date(previous.starts_at).getTime() !== new Date(startsAt).getTime() ||
+              previous.location !== location;
             const banner = Object.hasOwn(body, "bannerData") ? parseImage(body.bannerData) : null;
             const removeBanner = body.removeBanner === true;
             const updated = await client.query(`
@@ -1825,6 +1868,12 @@ export async function createApp({
           }
           const withStats = await getEvent(pool, updatedEventId);
           if (!withStats) fail(404, "Event not found.");
+          if (importantDetailsChanged) {
+            notifyEventAttendeesInBackground(updatedEventId, {
+              subject: `Event details updated: ${withStats.title}`,
+              text: `Important details for ${withStats.title} have changed.\n\nDate and time: ${new Date(withStats.starts_at).toISOString()}\nVenue: ${withStats.location}\n\nPlease review these updated event details before attending.`
+            });
+          }
           return jsonResponse(response, 200, { event: eventView(withStats) });
         }
         if (eventIdPath && method === "DELETE") {

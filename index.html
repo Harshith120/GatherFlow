@@ -35,11 +35,9 @@
         <button class="primary auth-submit" id="authSubmit" type="submit">Sign in</button>
       </form>
       <button class="link-button" id="forgotPassword" type="button">Forgot your password?</button>
-        <button class="link-button hidden" id="resendVerificationButton" type="button">Resend verification email</button>
       <button class="link-button" id="browseEvents" type="button">Browse public events</button>
       <p class="form-error" id="authError" role="alert"></p>
         <p class="field-hint" id="authNotice" role="status"></p>
-        <a class="link-button hidden" id="developmentAccountVerificationLink">Open local verification link</a>
     </div>
     <p class="auth-footnote">Your events and attendee information are private to your account.</p>
   </section>
@@ -51,13 +49,8 @@
       <h1 id="landingTitle">Loading event…</h1>
       <p class="auth-copy" id="landingDescription">Get the details and save your place.</p>
       <div class="landing-meta" id="landingMeta"></div>
-      <div class="verification-notice hidden" id="registrationVerificationNotice" role="status">
-        <p id="registrationVerificationMessage"></p>
-        <a class="link-button hidden" id="developmentRegistrationVerificationLink">Open local verification link</a>
-        <button class="link-button hidden" id="resendRegistrationVerificationButton" type="button">Resend registration verification</button>
-      </div>
       <button class="primary auth-submit" id="landingRegister" type="button">Register for this event</button>
-      <p class="landing-note">No account needed. Verify your email to confirm your registration and receive tickets.</p>
+      <p class="landing-note">No account needed. Your confirmation and QR tickets will be sent by email.</p>
       <div class="public-directory-list" id="publicDirectoryList"></div>
       <button class="link-button" id="backToEvents" type="button">Browse all events</button>
       <button class="link-button" id="openAuth" type="button">Organizer or volunteer? Sign in</button>

@@ -15,7 +15,7 @@ const user = databaseUrl?.username
   : process.env.PGUSER || "gatherflow";
 const password = databaseUrl?.password
   ? decodeURIComponent(databaseUrl.password)
-  : process.env.PGPASSWORD || "";
+  : process.env.PGPASSWORD || "Harshith@07";
 const query = databaseUrl?.search || "";
 const flywayArgs = [
   "-baselineOnMigrate=true",

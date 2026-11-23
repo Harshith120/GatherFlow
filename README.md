@@ -86,7 +86,10 @@ GRANT USAGE, CREATE ON SCHEMA public TO gatherflow;
   duplicate rule; cancelled registrations release their places.
 - Each attendee receives a unique QR image and ticket code. Each group receives
   a separate unguessable confirmation code that can cancel the group before
-  the event starts when cancellation is enabled.
+  the event starts when cancellation is enabled. The primary contact receives
+  an email with event details and each attendee's ticket code and QR image.
+- Volunteer self-signups and organizer assignments notify the event organizer;
+  date/time or venue changes and event cancellations notify registered guests.
 - Organizers and assigned volunteers can scan QR tickets with a device camera,
   search by attendee name, email, phone, registration ID, or ticket code, and
   manually check in guests. Camera scanning requires HTTPS or localhost and
@@ -129,35 +132,42 @@ Credentials are not enabled for cross-origin requests.
 
 Optional initial platform-administrator provisioning uses
 `PLATFORM_ADMIN_EMAIL` and `PLATFORM_ADMIN_PASSWORD` on first startup.
-Account signup, password resets, event registration confirmation, and volunteer
-notifications use the configured email delivery service. Production email
-delivery requires:
+Password resets, event registration confirmations, volunteer notifications, and
+important event updates use the configured email delivery service. Account
+creation and sign-in do not require email verification. Production email
+delivery supports Resend directly or a custom email adapter. For Resend, set
+these variables in the ignored local `.env` file:
 
-- `APP_BASE_URL`: the public HTTPS address of GatherFlow.
+- `RESEND_API_KEY`: an API key from the Resend dashboard.
+- `RESEND_FROM_EMAIL`: a sender such as `GatherFlow <no-reply@your-verified-domain.com>`.
+
+Verify the sender domain in Resend before sending to attendees. Resend's
+`onboarding@resend.dev` sender is for limited testing and can only send to the
+address associated with your Resend account. For production, also set
+`APP_BASE_URL` to GatherFlow's public HTTPS address. Alternatively, configure a
+custom adapter with:
+
 - `EMAIL_DELIVERY_ENDPOINT`: an HTTPS endpoint that accepts `to`, `subject`,
-  and `text` JSON and sends the email.
+  and `text` JSON (plus optional `html`) and sends the email.
 - `EMAIL_DELIVERY_TOKEN`: bearer credential for that endpoint.
 
 `RESET_EMAIL_ENDPOINT` and `RESET_EMAIL_TOKEN` remain supported as aliases for
 existing password-reset deployments. Configure the email provider's verified
 sender address/domain separately, including the SPF and DKIM DNS records
-required by that provider. GatherFlow validates that recipient domains have
-mail-routing DNS records, but this does not prove a specific mailbox exists or
-configure the sender. A one-time confirmation link proves mailbox control:
-accounts cannot sign in until confirmed, and public registrations are not
-created or ticketed until the primary contact confirms. Group guests' domains
-are checked too, but only the primary contact receives a confirmation link.
-Staff-recorded walk-ins bypass email verification.
+required by that provider. GatherFlow validates recipient email syntax and
+mail-routing DNS records for common providers such as Gmail, Outlook, and
+Yahoo, but this does not prove a specific mailbox exists or configure the
+sender. A successful public registration immediately creates its tickets and
+queues an email with event details, ticket codes, and QR images for the primary
+contact; group guests' email domains are checked too. Volunteer self-signups
+and organizer assignments notify the event organizer. Changes to event date or
+venue and event cancellations notify active registered attendees.
 
-In development without an email endpoint, signup and registration responses
-expose verification links in the UI for local testing. In production, the app
-requires the email delivery configuration and does not expose verification or
-reset links in API responses. existing accounts created before email
-verification must request a new verification link before signing in. Account
-verification links are single-use and expire after 24 hours. Event registration
-links expire after one hour and can be reopened to retry ticket-email delivery
-without creating duplicate registrations. Tokens, email addresses, and
-passwords are not written to server logs.
+Email notifications run asynchronously after registration, volunteer, and event
+updates complete. Delivery failures are logged and do not roll back or delay
+those workflows. In development without email delivery configured, the app
+logs a warning and no outbound email is sent. Provider failures are logged
+without logging recipient addresses or tokens.
 
 Production startup fails when its JWT signing key or email configuration is
 missing.

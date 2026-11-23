@@ -121,16 +121,6 @@ async function registerAccountThroughUi(app, t, window, { name, email, role = "O
   setValue(window, '#authForm [name="password"]', password);
   setValue(window, '#authForm [name="role"]', role);
   submit(window, "#authForm");
-  await waitFor(() => window.document.querySelector("#authNotice").textContent.includes("verification link"));
-  const verificationUrl = window.document.querySelector("#developmentAccountVerificationLink").href;
-  assert.ok(verificationUrl);
-  const verificationWindow = await openPage(t, app.baseUrl, "", verificationUrl);
-  click(verificationWindow, "#confirmEmailButton");
-  await waitFor(() => verificationWindow.document.querySelector("#authNotice").textContent.includes("Email verified"));
-  click(window, '.auth-tab[data-auth-mode="login"]');
-  setValue(window, '#authForm [name="email"]', email);
-  setValue(window, '#authForm [name="password"]', password);
-  submit(window, "#authForm");
   await waitFor(() => !window.document.querySelector("#appShell").classList.contains("hidden"));
   await waitFor(() => window.document.querySelector("#eventCards .empty-state, #eventCards .event-card, #eventCards [data-status-event], #eventCards [data-join-volunteer]"));
   return window.localStorage.getItem("gatherflow.session");
@@ -146,17 +136,6 @@ async function loginThroughUi(window, email, accountPassword = password) {
   submit(window, "#authForm");
   await waitFor(() => !window.document.querySelector("#appShell").classList.contains("hidden"));
   await waitFor(() => window.document.querySelector("#eventCards .empty-state, #eventCards .event-card, #eventCards [data-status-event], #eventCards [data-join-volunteer]"));
-}
-
-async function verifyThroughUi(t, app, verificationUrl) {
-  const pageUrl = new URL(verificationUrl, app.baseUrl).toString();
-  const window = await openPage(t, app.baseUrl, "", pageUrl);
-  click(window, "#confirmEmailButton");
-  await waitFor(() =>
-    window.document.querySelector("#ticketDialog").open ||
-    window.document.querySelector("#authNotice").textContent.includes("Email verified")
-  );
-  return window;
 }
 
 async function createEventThroughUi(window, title) {
@@ -176,13 +155,8 @@ async function createAccount(app, name, email, role = "ORGANIZER") {
     method: "POST",
     body: { name, email, password, role }
   });
-  assert.equal(result.status, 202);
-  const token = new URL(result.data.verificationUrl, app.baseUrl).searchParams.get("verifyEmail");
-  const verified = await app.request("/api/auth/verify-email", { method: "POST", body: { token } });
-  assert.equal(verified.status, 200);
-  const login = await app.request("/api/auth/login", { method: "POST", body: { email, password } });
-  assert.equal(login.status, 200);
-  return login.data;
+  assert.equal(result.status, 201);
+  return result.data;
 }
 
 async function createPublishedEvent(app, token, title) {
@@ -257,13 +231,10 @@ test("frontend public registration displays a QR ticket backed by a stored regis
   setValue(window, '#registrationForm [name="email"]', `attendee-${randomUUID()}@example.test`);
   setValue(window, '#registrationForm [name="phone"]', "555-0101");
   submit(window, "#registrationForm");
-  await waitFor(() => !window.document.querySelector("#registrationVerificationNotice").classList.contains("hidden"));
-  const verificationUrl = window.document.querySelector("#developmentRegistrationVerificationLink").href;
-  const verificationWindow = await verifyThroughUi(t, app, verificationUrl);
-  await waitFor(() => verificationWindow.document.querySelector("#ticketDialog").open);
+  await waitFor(() => window.document.querySelector("#ticketDialog").open);
 
-  const ticket = verificationWindow.document.querySelector(".ticket-card code").textContent;
-  const qr = verificationWindow.document.querySelector(".ticket-qr");
+  const ticket = window.document.querySelector(".ticket-card code").textContent;
+  const qr = window.document.querySelector(".ticket-qr");
   assert.ok(ticket);
   assert.match(qr.src, /^data:image\/png;base64,/);
   const stored = await app.pool.query(
@@ -285,10 +256,8 @@ test("frontend attendee search and QR scan check in the selected volunteer event
     method: "POST",
     body: { name: "Searchable Guest", email: attendeeEmail, phone: "555-0202", answers: {} }
   });
-  assert.equal(registration.status, 202);
-  const confirmedPage = await verifyThroughUi(t, app, registration.data.verificationUrl);
-  await waitFor(() => confirmedPage.document.querySelector("#ticketDialog").open);
-  const ticketCode = confirmedPage.document.querySelector(".ticket-card code").textContent;
+  assert.equal(registration.status, 201);
+  const ticketCode = registration.data.registrations[0].ticket_code;
   const persistedRegistration = await app.pool.query(
     "SELECT r.id FROM registrations r JOIN tickets t ON t.registration_id=r.id WHERE t.ticket_code=$1",
     [ticketCode]
@@ -360,11 +329,8 @@ test("end-to-end organizer, attendee, and volunteer journey updates the dashboar
   setValue(attendeeWindow, '#registrationForm [name="email"]', attendeeEmail);
   setValue(attendeeWindow, '#registrationForm [name="phone"]', "555-0303");
   submit(attendeeWindow, "#registrationForm");
-  await waitFor(() => !attendeeWindow.document.querySelector("#registrationVerificationNotice").classList.contains("hidden"));
-  const registrationVerificationUrl = attendeeWindow.document.querySelector("#developmentRegistrationVerificationLink").href;
-  const attendeeVerificationWindow = await verifyThroughUi(t, app, registrationVerificationUrl);
-  await waitFor(() => attendeeVerificationWindow.document.querySelector("#ticketDialog").open);
-  const ticketCode = attendeeVerificationWindow.document.querySelector(".ticket-card code").textContent;
+  await waitFor(() => attendeeWindow.document.querySelector("#ticketDialog").open);
+  const ticketCode = attendeeWindow.document.querySelector(".ticket-card code").textContent;
   assert.ok(ticketCode);
   const persistedRegistration = await app.pool.query(
     "SELECT registrations.id, attendees.name, tickets.ticket_code FROM registrations JOIN attendees ON attendees.id=registrations.attendee_profile_id JOIN tickets ON tickets.registration_id=registrations.id WHERE tickets.ticket_code=$1",

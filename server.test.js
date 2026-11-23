@@ -10,6 +10,7 @@ async function setup(t, appOptions = {}) {
   const pool = new MemoryPool();
   const resetMessages = [];
   const emailMessages = [];
+  const emailErrors = [];
   for (const migration of ["V1__initial.sql", "V2__smart_checkin.sql", "V3__normalized_event_operations.sql", "V4__email_verification.sql"]) {
     const sql = readFileSync(new URL(`./migrations/${migration}`, import.meta.url), "utf8");
     for (const statement of sql.split(";").map(part => part.trim()).filter(Boolean)) {
@@ -23,6 +24,7 @@ async function setup(t, appOptions = {}) {
     jwtSecret: "test-secret-with-enough-entropy-for-auth",
     skipMigrationCheck: true,
     resetLog: message => resetMessages.push(message),
+    emailErrorLog: message => emailErrors.push(message),
     emailDomainCheck: async () => true,
     emailDelivery: async message => emailMessages.push(message),
     ...appOptions
@@ -34,6 +36,7 @@ async function setup(t, appOptions = {}) {
     pool,
     resetMessages,
     emailMessages,
+    emailErrors,
     async request(path, { token, method = "GET", body, headers: extraHeaders = {} } = {}) {
       const response = await fetch(`${baseUrl}${path}`, {
         method,
@@ -56,33 +59,32 @@ async function createUser(app, name, email, role = "ORGANIZER") {
     method: "POST",
     body: { name, email, password: "A-secure-test-password-2026", role }
   });
-  assert.equal(response.status, 202);
-  const message = [...app.emailMessages].reverse().find(item => item.to === email && item.purpose === "ACCOUNT_VERIFICATION");
-  const token = message?.text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
-  assert.ok(token, "account verification email should contain its one-time link");
-  const verification = await app.request("/api/auth/verify-email", { method: "POST", body: { token } });
-  assert.equal(verification.status, 200);
-  const login = await app.request("/api/auth/login", {
-    method: "POST",
-    body: { email, password: "A-secure-test-password-2026" }
-  });
-  assert.equal(login.status, 200);
-  return login.data;
+  assert.equal(response.status, 201);
+  assert.ok(response.data.token);
+  return response.data;
 }
 
 async function completeRegistration(app, eventId, body, options = {}) {
-  const pending = await app.request(`/api/events/${eventId}/registrations`, {
+  return app.request(`/api/events/${eventId}/registrations`, {
     method: "POST",
     ...options,
     body
   });
-  if (pending.status !== 202) return pending;
-  const message = [...app.emailMessages].reverse().find(item =>
-    item.to === String(body.email).trim().toLowerCase() && item.purpose === "EVENT_REGISTRATION_VERIFICATION"
-  );
-  const token = message?.text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
-  assert.ok(token, "registration verification email should contain its one-time link");
-  return app.request("/api/auth/verify-email", { method: "POST", body: { token } });
+}
+
+async function waitForEmail(app, predicate, timeoutMs = 1000) {
+  await waitUntil(() => app.emailMessages.find(predicate), timeoutMs);
+  return app.emailMessages.find(predicate);
+}
+
+async function waitUntil(predicate, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await predicate();
+    if (result) return result;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.fail("Timed out waiting for the expected operation.");
 }
 
 async function createEvent(app, token, { title = "Neighborhood gathering", capacity = 5, extra = {} } = {}) {
@@ -142,74 +144,23 @@ test("authentication accepts valid credentials and protects account routes", asy
   assert.equal((await app.request("/api/auth/me", { token: "invalid.token.value" })).status, 401);
 });
 
-test("unverified accounts cannot sign in and a failed resend preserves the original link", async t => {
-  const messages = [];
-  let deliveryUnavailable = false;
-  const app = await setup(t, {
-    emailDelivery: async message => {
-      if (deliveryUnavailable) throw new Error("mail service unavailable");
-      messages.push(message);
-    }
-  });
-  const email = "pending-account@example.test";
+test("account creation and sign-in do not require email verification or successful email delivery", async t => {
+  const app = await setup(t, { emailDelivery: async () => { throw new Error("mail service unavailable"); } });
+  const email = "unverified-account@example.test";
   const created = await app.request("/api/auth/register", {
     method: "POST",
-    body: { name: "Pending Account", email, password: "A-secure-test-password-2026" }
+    body: { name: "Unverified Account", email, password: "A-secure-test-password-2026" }
   });
-  assert.equal(created.status, 202);
-  const original = messages[0].text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
-  assert.ok(original);
-  assert.equal((await app.request("/api/auth/login", {
+  assert.equal(created.status, 201);
+  assert.ok(created.data.token);
+  const stored = await app.pool.query("SELECT email_verified_at FROM users WHERE email=$1", [email]);
+  assert.equal(stored.rows[0].email_verified_at, null);
+  const login = await app.request("/api/auth/login", {
     method: "POST",
     body: { email, password: "A-secure-test-password-2026" }
-  })).status, 403);
-
-  deliveryUnavailable = true;
-  const resend = await app.request("/api/auth/resend-verification", {
-    method: "POST",
-    body: { email }
   });
-  assert.equal(resend.status, 502);
-  deliveryUnavailable = false;
-
-  const verified = await app.request("/api/auth/verify-email", {
-    method: "POST",
-    body: { token: original }
-  });
-  assert.equal(verified.status, 200);
-  assert.equal(verified.data.verified, true);
-  assert.equal((await app.request("/api/auth/verify-email", {
-    method: "POST",
-    body: { token: original }
-  })).status, 400);
-  assert.equal((await app.request("/api/auth/login", {
-    method: "POST",
-    body: { email, password: "A-secure-test-password-2026" }
-  })).status, 200);
-});
-
-test("expired account verification links cannot activate an account", async t => {
-  const app = await setup(t);
-  const email = "expired-account@example.test";
-  await app.request("/api/auth/register", {
-    method: "POST",
-    body: { name: "Expired Account", email, password: "A-secure-test-password-2026" }
-  });
-  const token = app.emailMessages[0].text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
-  assert.ok(token);
-  const user = await app.pool.query("SELECT id FROM users WHERE email=$1", [email]);
-  await app.pool.query(
-    "UPDATE email_verification_tokens SET expires_at=$1 WHERE user_id=$2 AND purpose='ACCOUNT'",
-    [new Date(Date.now() - 1000), user.rows[0].id]
-  );
-  assert.equal((await app.request("/api/auth/verify-email", {
-    method: "POST",
-    body: { token }
-  })).status, 400);
-  assert.equal((await app.request("/api/auth/login", {
-    method: "POST",
-    body: { email, password: "A-secure-test-password-2026" }
-  })).status, 403);
+  assert.equal(login.status, 200);
+  assert.equal((await app.request("/api/auth/me", { token: login.data.token })).status, 200);
 });
 
 test("email validation normalizes IDN domains and rejects malformed, undeliverable, or uncheckable domains", async t => {
@@ -243,9 +194,24 @@ test("email validation normalizes IDN domains and rejects malformed, undeliverab
     method: "POST",
     body: { name: "IDN Address", email: "person@bücher.example", password: "A-secure-test-password-2026" }
   });
-  assert.equal(idn.status, 202);
+  assert.equal(idn.status, 201);
   assert.ok(checkedDomains.includes("xn--bcher-kva.example"));
-  assert.equal(app.emailMessages.at(-1).to, "person@xn--bcher-kva.example");
+  assert.ok((await app.request("/api/auth/login", {
+    method: "POST",
+    body: { email: "person@bücher.example", password: "A-secure-test-password-2026" }
+  })).data.token);
+  for (const domain of ["gmail.com", "outlook.com", "yahoo.com"]) {
+    const provider = await app.request("/api/auth/register", {
+      method: "POST",
+      body: {
+        name: "Mail Provider",
+        email: `provider@${domain}`,
+        password: "A-secure-test-password-2026"
+      }
+    });
+    assert.equal(provider.status, 201);
+    assert.ok(checkedDomains.includes(domain));
+  }
 });
 
 test("public group registration checks every email domain while staff walk-ins bypass confirmation", async t => {
@@ -292,100 +258,104 @@ test("public group registration checks every email domain while staff walk-ins b
   );
   assert.equal(source.rows[0].registration_source, "WALK_IN");
   assert.equal(domains.length, checksBeforeWalkIn);
+  const walkInEmail = await waitForEmail(app, message =>
+    message.to === "walkin@unroutable.example" && message.purpose === "REGISTRATION_CONFIRMATION"
+  );
+  assert.match(walkInEmail.html, /data:image\/png;base64,/);
 });
 
-test("failed event-registration resend preserves the previously delivered confirmation link", async t => {
+test("public registration completes before confirmation email delivery and emails event details with QR tickets", async t => {
   const messages = [];
-  let deliveryUnavailable = false;
+  let releaseDelivery;
   const app = await setup(t, {
     emailDelivery: async message => {
-      if (deliveryUnavailable) throw new Error("mail service unavailable");
       messages.push(message);
+      await new Promise(resolve => { releaseDelivery = resolve; });
     }
   });
-  const organizerEmail = "resend-organizer@example.test";
-  await app.request("/api/auth/register", {
-    method: "POST",
-    body: { name: "Registration Resend Organizer", email: organizerEmail, password: "A-secure-test-password-2026", role: "ORGANIZER" }
-  });
-  const organizerToken = messages.find(message => message.to === organizerEmail && message.purpose === "ACCOUNT_VERIFICATION")
-    ?.text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
-  assert.ok(organizerToken);
-  await app.request("/api/auth/verify-email", { method: "POST", body: { token: organizerToken } });
-  const organizerLogin = await app.request("/api/auth/login", {
-    method: "POST",
-    body: { email: organizerEmail, password: "A-secure-test-password-2026" }
-  });
-  assert.equal(organizerLogin.status, 200);
-  const organizer = organizerLogin.data;
+  const organizer = await createUser(app, "Registration Organizer", "pending-organizer@example.test");
   const event = await createEvent(app, organizer.token);
   await publish(app, organizer.token, event.id);
-  const email = "resend-contact@example.test";
-  const pending = await app.request(`/api/events/${event.id}/registrations`, {
+  const result = await app.request(`/api/events/${event.id}/registrations`, {
     method: "POST",
-    body: registration("Resend Contact", email)
+    body: registration("Email Ticket Guest", "ticket-guest@example.test")
   });
-  assert.equal(pending.status, 202);
-  const original = messages.find(message => message.to === email && message.purpose === "EVENT_REGISTRATION_VERIFICATION")
-    ?.text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
-  assert.ok(original);
-
-  deliveryUnavailable = true;
-  const resend = await app.request(`/api/events/${event.id}/registrations/resend-verification`, {
-    method: "POST",
-    body: { email }
-  });
-  assert.equal(resend.status, 502);
-  deliveryUnavailable = false;
-
-  const verified = await app.request("/api/auth/verify-email", {
-    method: "POST",
-    body: { token: original }
-  });
-  assert.equal(verified.status, 200);
-  assert.equal(verified.data.registrations.length, 1);
-});
-
-test("public registrations remain pending until email verification and link retries do not duplicate tickets", async t => {
-  const app = await setup(t);
-  const organizer = await createUser(app, "Pending Registration Organizer", "pending-organizer@example.test");
-  const event = await createEvent(app, organizer.token);
-  await publish(app, organizer.token, event.id);
-  const pending = await app.request(`/api/events/${event.id}/registrations`, {
-    method: "POST",
-    body: registration("Pending Attendee", "pending-attendee@example.test")
-  });
-  assert.equal(pending.status, 202);
-  const token = app.emailMessages.find(message =>
-    message.to === "pending-attendee@example.test" && message.purpose === "EVENT_REGISTRATION_VERIFICATION"
-  )?.text.match(/[?&]verifyEmail=([\w-]+)/)?.[1];
-  assert.ok(token);
-  const beforeVerification = await app.pool.query(`
-    SELECT COUNT(*) AS registrations FROM registrations WHERE event_id=$1
-  `, [event.id]);
-  assert.equal(Number(beforeVerification.rows[0].registrations), 0);
-
-  const firstConfirmation = await app.request("/api/auth/verify-email", {
-    method: "POST",
-    body: { token }
-  });
-  assert.equal(firstConfirmation.status, 200);
-  assert.equal(firstConfirmation.data.registrations.length, 1);
-  const retry = await app.request("/api/auth/verify-email", {
-    method: "POST",
-    body: { token }
-  });
-  assert.equal(retry.status, 200);
+  assert.equal(result.status, 201);
+  assert.equal(result.data.registrations.length, 1);
+  assert.ok(result.data.registrations[0].qrCode.startsWith("data:image/png;base64,"));
   const persisted = await app.pool.query(`
     SELECT COUNT(*) AS registrations FROM registrations WHERE event_id=$1
   `, [event.id]);
-  const tickets = await app.pool.query(`
-    SELECT COUNT(*) AS tickets FROM tickets
-    JOIN registrations ON registrations.id=tickets.registration_id
-    WHERE registrations.event_id=$1
-  `, [event.id]);
   assert.equal(Number(persisted.rows[0].registrations), 1);
-  assert.equal(Number(tickets.rows[0].tickets), 1);
+  await waitUntil(() => messages.find(message => message.to === "ticket-guest@example.test"));
+  assert.equal(messages[0].purpose, "REGISTRATION_CONFIRMATION");
+  assert.match(messages[0].text, /Date and time:[\s\S]*Venue:/);
+  assert.match(messages[0].text, /Email Ticket Guest:/);
+  assert.match(messages[0].html, /data:image\/png;base64,/);
+  assert.match(messages[0].html, /Austin, TX/);
+  releaseDelivery();
+});
+
+test("email provider failures are logged without failing registration", async t => {
+  const app = await setup(t, {
+    emailDelivery: async () => { throw new Error("provider unavailable"); }
+  });
+  const organizer = await createUser(app, "Email Failure Organizer", "email-failure-owner@example.test");
+  const event = await createEvent(app, organizer.token);
+  await publish(app, organizer.token, event.id);
+
+  const result = await app.request(`/api/events/${event.id}/registrations`, {
+    method: "POST",
+    body: registration("Email Failure Guest", "email-failure-guest@example.test")
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.data.registrations.length, 1);
+  await waitUntil(() => app.emailErrors.length > 0);
+  assert.match(app.emailErrors[0], /REGISTRATION_CONFIRMATION email delivery failed: provider unavailable/);
+  const saved = await app.pool.query(
+    "SELECT COUNT(*) AS count FROM registrations WHERE event_id=$1",
+    [event.id]
+  );
+  assert.equal(Number(saved.rows[0].count), 1);
+});
+
+test("Resend receives authenticated transactional email including HTML tickets", async t => {
+  const previousApiKey = process.env.RESEND_API_KEY;
+  const previousFromEmail = process.env.RESEND_FROM_EMAIL;
+  process.env.RESEND_API_KEY = "re_test-key";
+  process.env.RESEND_FROM_EMAIL = "GatherFlow <tickets@example.test>";
+  t.after(() => {
+    if (previousApiKey === undefined) delete process.env.RESEND_API_KEY;
+    else process.env.RESEND_API_KEY = previousApiKey;
+    if (previousFromEmail === undefined) delete process.env.RESEND_FROM_EMAIL;
+    else process.env.RESEND_FROM_EMAIL = previousFromEmail;
+  });
+
+  const requests = [];
+  const app = await setup(t, {
+    emailDelivery: null,
+    emailFetch: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true, status: 200 };
+    }
+  });
+  const organizer = await createUser(app, "Resend Organizer", "resend-owner@example.test");
+  const event = await createEvent(app, organizer.token);
+  await publish(app, organizer.token, event.id);
+  const result = await app.request(`/api/events/${event.id}/registrations`, {
+    method: "POST",
+    body: registration("Resend Guest", "resend-guest@example.test")
+  });
+  assert.equal(result.status, 201);
+
+  await waitUntil(() => requests.length === 1);
+  assert.equal(requests[0].url, "https://api.resend.com/emails");
+  assert.equal(requests[0].options.headers.Authorization, "Bearer re_test-key");
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(payload.from, "GatherFlow <tickets@example.test>");
+  assert.deepEqual(payload.to, ["resend-guest@example.test"]);
+  assert.equal(payload.subject, `Registration confirmed: ${event.title}`);
+  assert.match(payload.html, /data:image\/png;base64,/);
 });
 
 test("published events collect validated group registrations with unique QR tickets", async t => {
@@ -418,7 +388,7 @@ test("published events collect validated group registrations with unique QR tick
       groupName: "Lee family",
       attendees: [registration("Taylor Lee", "taylor@example.test", { diet: "None" })]
   });
-  assert.equal(group.status, 200);
+  assert.equal(group.status, 201);
   assert.equal(group.data.registrations.length, 2);
   assert.notEqual(group.data.registrations[0].ticket_code, group.data.registrations[1].ticket_code);
   assert.ok(group.data.registrations.every(person => person.qrCode.startsWith("data:image/png;base64,")));
@@ -476,7 +446,7 @@ test("cancellation releases event capacity and check-in rejects cancelled attend
   assert.equal(cancellationAudit.rows[0].metadata.attendeeCount, 1);
 
   const replacement = await completeRegistration(app, event.id, registration("Replacement Guest", "replacement@example.test"));
-  assert.equal(replacement.status, 200);
+  assert.equal(replacement.status, 201);
   const reusedCancellation = await app.request(`/api/registrations/${original.data.confirmationCode}/cancel`, { method: "POST", body: {} });
   assert.equal(reusedCancellation.status, 409);
 
@@ -565,6 +535,49 @@ test("event owners can edit, publish, close, and archive only their own events",
   ]));
 });
 
+test("important event changes and cancellations notify active registered attendees", async t => {
+  const app = await setup(t);
+  const organizer = await createUser(app, "Update Organizer", "update-organizer@example.test");
+  const event = await createEvent(app, organizer.token, { title: "Community dinner" });
+  await publish(app, organizer.token, event.id);
+  const registrationResult = await completeRegistration(app, event.id, {
+    ...registration("Primary Guest", "primary-update@example.test"),
+    attendees: [registration("Group Guest", "group-update@example.test")]
+  });
+  assert.equal(registrationResult.status, 201);
+
+  const revisedDate = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+  const edited = await app.request(`/api/events/${event.id}`, {
+    method: "PATCH",
+    token: organizer.token,
+    body: { startsAt: revisedDate, location: "New Community Hall" }
+  });
+  assert.equal(edited.status, 200);
+  const primaryUpdate = await waitForEmail(app, message =>
+    message.to === "primary-update@example.test" && message.purpose === "EVENT_UPDATE"
+  );
+  const groupUpdate = await waitForEmail(app, message =>
+    message.to === "group-update@example.test" && message.purpose === "EVENT_UPDATE"
+  );
+  assert.match(primaryUpdate.text, /New Community Hall/);
+  assert.match(primaryUpdate.text, /Community dinner/);
+  assert.match(groupUpdate.text, /Date and time:/);
+
+  const cancelled = await app.request(`/api/events/${event.id}/status`, {
+    method: "PATCH",
+    token: organizer.token,
+    body: { status: "CANCELLED" }
+  });
+  assert.equal(cancelled.status, 200);
+  const cancellation = await waitForEmail(app, message =>
+    message.to === "primary-update@example.test" && message.subject.startsWith("Event cancelled:")
+  );
+  assert.match(cancellation.text, /has been cancelled/);
+  await waitForEmail(app, message =>
+    message.to === "group-update@example.test" && message.subject.startsWith("Event cancelled:")
+  );
+});
+
 test("event banners are validated, stored in PostgreSQL, and removed on request", async t => {
   const app = await setup(t);
   const organizer = await createUser(app, "Banner Owner", "banner@example.test");
@@ -609,8 +622,8 @@ test("duplicate registration policy can be configured per event", async t => {
   await publish(app, organizer.token, event.id);
   const first = await completeRegistration(app, event.id, registration("Guest One", "repeat@example.test"));
   const second = await completeRegistration(app, event.id, registration("Guest Two", "REPEAT@example.test"));
-  assert.equal(first.status, 200);
-  assert.equal(second.status, 200);
+  assert.equal(first.status, 201);
+  assert.equal(second.status, 201);
 
   const edited = await app.request(`/api/events/${event.id}`, {
     method: "PATCH",
@@ -789,6 +802,47 @@ test("volunteers can discover upcoming events, join, and leave the event team", 
   assert.equal((await app.request(`/api/events/${event.id}/attendees`, { token: volunteer.token })).status, 403);
 });
 
+test("volunteer self-registration and organizer assignment notify the event organizer", async t => {
+  const app = await setup(t);
+  const organizer = await createUser(app, "Volunteer Organizer", "volunteer-owner@example.test");
+  const volunteer = await createUser(app, "Volunteer Applicant", "volunteer-applicant@example.test", "VOLUNTEER");
+  const selfJoinEvent = await createEvent(app, organizer.token, { title: "Volunteer Signup Event" });
+  await publish(app, organizer.token, selfJoinEvent.id);
+
+  const joined = await app.request(`/api/events/${selfJoinEvent.id}/volunteers`, {
+    method: "POST",
+    token: volunteer.token,
+    body: {}
+  });
+  assert.equal(joined.status, 201);
+  const selfJoinNotice = await waitForEmail(app, message =>
+    message.to === organizer.user.email &&
+    message.purpose === "VOLUNTEER_ASSIGNMENT" &&
+    message.subject.includes("Volunteer Signup Event")
+  );
+  assert.match(selfJoinNotice.text, /Volunteer Applicant/);
+  assert.match(selfJoinNotice.text, /volunteer-applicant@example\.test/);
+  assert.match(selfJoinNotice.text, /Assigned role: Volunteer/);
+
+  const assignedEvent = await createEvent(app, organizer.token, { title: "Volunteer Assignment Event" });
+  const assigned = await app.request(`/api/events/${assignedEvent.id}/volunteers`, {
+    method: "POST",
+    token: organizer.token,
+    body: { email: volunteer.user.email }
+  });
+  assert.equal(assigned.status, 201);
+  const assignmentNotice = await waitForEmail(app, message =>
+    message.to === organizer.user.email &&
+    message.purpose === "VOLUNTEER_ASSIGNMENT" &&
+    message.subject.includes("Volunteer Assignment Event")
+  );
+  assert.match(assignmentNotice.text, /Assigned role: Volunteer/);
+  await waitForEmail(app, message =>
+    message.to === volunteer.user.email &&
+    message.subject.includes("Volunteer Assignment Event")
+  );
+});
+
 test("password reset links are single-use and invalidate existing sessions", async t => {
   const app = await setup(t);
   const account = await createUser(app, "Pat Attendee", "pat@example.test", "ATTENDEE");
@@ -899,7 +953,7 @@ test("organizer dashboard aggregates database activity and isolates other organi
   await publish(app, organizer.token, event.id);
 
   const publicRegistration = await completeRegistration(app, event.id, registration("Jordan Guest", "jordan@example.test"));
-  assert.equal(publicRegistration.status, 200);
+  assert.equal(publicRegistration.status, 201);
   const walkInRegistration = await app.request(`/api/events/${event.id}/registrations`, {
     method: "POST",
     token: organizer.token,
@@ -1034,7 +1088,7 @@ test("organizers can record distinct walk-ins after online registration closes",
   const event = await createEvent(app, organizer.token);
   await publish(app, organizer.token, event.id);
   const existing = await completeRegistration(app, event.id, registration("Jordan Guest", "jordan@example.test"));
-  assert.equal(existing.status, 200);
+  assert.equal(existing.status, 201);
   const started = await app.request(`/api/events/${event.id}`, {
     method: "PATCH",
     token: organizer.token,

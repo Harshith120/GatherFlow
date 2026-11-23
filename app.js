@@ -21,7 +21,6 @@ let recoveryMode = false;
 let scannerControls = null;
 let ticketScanBusy = false;
 let emailVerificationToken = "";
-let registrationVerificationEventId = "";
 
 function escapeHtml(value = "") {
   return String(value).replace(/[&<>"']/g, character => ({
@@ -102,11 +101,9 @@ function setAuthMode(mode) {
   $("#roleField").classList.toggle("hidden", !isRegister);
   $("#nameField input").required = isRegister;
   $("#forgotPassword").classList.toggle("hidden", isRegister);
-  $("#resendVerificationButton").classList.add("hidden");
   $("#authSubmit").textContent = isRegister ? "Create account" : "Sign in";
   $("#authError").textContent = "";
   $("#authNotice").textContent = "";
-  $("#developmentAccountVerificationLink").classList.add("hidden");
 }
 
 function showAuth() {
@@ -141,7 +138,6 @@ async function showPublicDirectory() {
   $("#backToEvents").classList.add("hidden");
   $("#publicDirectoryList").classList.remove("hidden");
   $("#landingError").textContent = "";
-  $("#registrationVerificationNotice").classList.add("hidden");
   try {
     const result = await api("/api/public/events");
     publicDirectory = result.events;
@@ -625,7 +621,6 @@ function readQuestionAnswers(container) {
 
 function openRegistration(event) {
   currentRegistrationEvent = event;
-  registrationVerificationEventId = event.id;
   $("#registrationForm").reset();
   $("#guestFields").replaceChildren();
   $("#registrationTitle").textContent = `Register for ${event.title}`;
@@ -643,7 +638,6 @@ function showPublicLanding(event) {
   $("#appShell").classList.add("hidden");
   $("#emailVerificationScreen").classList.add("hidden");
   $("#publicLanding").classList.remove("hidden");
-  $("#registrationVerificationNotice").classList.add("hidden");
   $("#publicDirectoryList").classList.add("hidden");
   $("#landingMeta").classList.remove("hidden");
   $("#landingRegister").classList.remove("hidden");
@@ -847,20 +841,8 @@ $("#authForm").addEventListener("submit", async event => {
   setButtonBusy(submit, authMode === "register" ? "Creating account…" : "Signing in…");
   $("#authError").textContent = "";
   $("#authNotice").textContent = "";
-  $("#resendVerificationButton").classList.add("hidden");
-  $("#developmentAccountVerificationLink").classList.add("hidden");
   try {
     const result = await api(endpoint, { method: "POST", body: JSON.stringify(values) });
-    if (result.verificationRequired) {
-      $("#authNotice").textContent = result.message;
-      form.elements.password.value = "";
-      if (result.verificationUrl) {
-        const link = $("#developmentAccountVerificationLink");
-        link.href = result.verificationUrl;
-        link.classList.remove("hidden");
-      }
-      return;
-    }
     sessionToken = result.token;
     localStorage.setItem(tokenKey, sessionToken);
     user = result.user;
@@ -868,30 +850,8 @@ $("#authForm").addEventListener("submit", async event => {
     await showApp();
   } catch (error) {
     $("#authError").textContent = error.message;
-    $("#resendVerificationButton").classList.toggle("hidden", error.status !== 403 || authMode !== "login");
   } finally {
     setButtonBusy(submit);
-  }
-});
-
-$("#resendVerificationButton").addEventListener("click", async () => {
-  const email = $("#authForm").elements.email.value;
-  $("#authError").textContent = "";
-  $("#authNotice").textContent = "";
-  $("#developmentAccountVerificationLink").classList.add("hidden");
-  try {
-    const result = await api("/api/auth/resend-verification", {
-      method: "POST",
-      body: JSON.stringify({ email })
-    });
-    $("#authNotice").textContent = result.message;
-    if (result.verificationUrl) {
-      const link = $("#developmentAccountVerificationLink");
-      link.href = result.verificationUrl;
-      link.classList.remove("hidden");
-    }
-  } catch (error) {
-    $("#authError").textContent = error.message;
   }
 });
 
@@ -1218,20 +1178,8 @@ $("#registrationForm").addEventListener("submit", async event => {
       body: JSON.stringify({ ...data, attendees: guests })
     });
     form.closest("dialog").close();
-    if (result.verificationRequired) {
-      $("#registrationVerificationMessage").textContent = result.message;
-      $("#registrationVerificationNotice").classList.remove("hidden");
-      $("#resendRegistrationVerificationButton").classList.remove("hidden");
-      const link = $("#developmentRegistrationVerificationLink");
-      link.classList.add("hidden");
-      if (result.verificationUrl) {
-        link.href = result.verificationUrl;
-        link.classList.remove("hidden");
-      }
-      return;
-    }
     showTicketConfirmation(result, currentRegistrationEvent.allow_cancellations);
-    showToast("Registration complete. Save your ticket and confirmation.");
+    showToast(result.message || "Registration complete. Save your ticket and confirmation.");
     if (!sessionToken) {
       const updated = await api(`/api/events/${currentRegistrationEvent.id}`);
       window.publicEvent = updated.event;
@@ -1373,25 +1321,6 @@ $("#publicEventList").addEventListener("click", event => {
 });
 $("#landingRegister").addEventListener("click", () => {
   if (window.publicEvent?.canRegister) openRegistration(window.publicEvent);
-});
-$("#resendRegistrationVerificationButton").addEventListener("click", async () => {
-  const email = $("#registrationForm").elements.email.value;
-  const notice = $("#registrationVerificationMessage");
-  const link = $("#developmentRegistrationVerificationLink");
-  link.classList.add("hidden");
-  try {
-    const result = await api(`/api/events/${registrationVerificationEventId}/registrations/resend-verification`, {
-      method: "POST",
-      body: JSON.stringify({ email })
-    });
-    notice.textContent = result.message;
-    if (result.verificationUrl) {
-      link.href = result.verificationUrl;
-      link.classList.remove("hidden");
-    }
-  } catch (error) {
-    notice.textContent = error.message;
-  }
 });
 $("#copyTickets").addEventListener("click", async () => {
   const codes = [
