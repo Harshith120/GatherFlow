@@ -51,12 +51,45 @@ databases using the earlier `schema_migrations` table are baselined at version 2
 and upgraded by V3 and V4 without deleting registration data.
 
 Docker Compose starts PostgreSQL, runs Flyway migrations, and then starts
-GatherFlow. Set a local database password before running it:
+GatherFlow. PostgreSQL data is stored in the named `gatherflow-postgres` volume.
+The database is also published to `127.0.0.1:5433` so a Node.js process running
+on the host can use the same database. Copy `.env.example` only if you do not
+already have a `.env`; keep existing settings and set `POSTGRES_PASSWORD` to
+the password already used by the database volume:
 
 ```powershell
-$env:POSTGRES_PASSWORD = "choose-a-local-password"
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+# Edit .env without overwriting existing secrets.
 docker compose up --build
 ```
+
+Event registration links use `APP_BASE_URL`. The example value
+`http://localhost:3000` only works on the computer running GatherFlow. To share
+events with people outside your local network, set `APP_BASE_URL` in `.env` to
+the public HTTPS address that points to this app, then rebuild/restart it with
+`docker compose up -d --build`. That address must resolve publicly and be routed
+to the GatherFlow container through your hosting provider, reverse proxy, or
+tunnel; changing the link alone does not publish a local Docker app.
+
+Docker Compose gives process-level environment variables precedence over `.env`.
+If this PowerShell session has an old `POSTGRES_PASSWORD`, clear it before
+starting Compose so it uses the value in `.env`:
+
+```powershell
+Remove-Item Env:POSTGRES_PASSWORD -ErrorAction SilentlyContinue
+```
+
+The root `.env` file is Git-ignored. When running GatherFlow directly with
+`npm.cmd start` or `npm.cmd run serve`, the Node scripts load `.env` and default
+to the same database at `127.0.0.1:5433`, using `POSTGRES_PASSWORD` for its
+password. If the Docker app is already using port 3000, set `$env:PORT` to a
+different port before starting the host Node server. To use another host port
+for PostgreSQL, set `POSTGRES_PORT` in `.env`.
+
+Changing `POSTGRES_PASSWORD` does not update the role password in an existing
+PostgreSQL volume. To rotate it, update the role with `\password gatherflow`
+from a `psql` session, set the same value in `.env`, then recreate the app and
+Flyway services. Do not remove the volume to resolve an authentication error.
 
 If startup reports that PostgreSQL is unreachable, start the PostgreSQL service
 or use the Docker Compose command above. For a local PostgreSQL installation,
@@ -144,8 +177,8 @@ these variables in the ignored local `.env` file:
 Verify the sender domain in Resend before sending to attendees. Resend's
 `onboarding@resend.dev` sender is for limited testing and can only send to the
 address associated with your Resend account. For production, also set
-`APP_BASE_URL` to GatherFlow's public HTTPS address. Alternatively, configure a
-custom adapter with:
+`APP_BASE_URL` to GatherFlow's public HTTPS address; this is also used for event
+registration links. Alternatively, configure a custom adapter with:
 
 - `EMAIL_DELIVERY_ENDPOINT`: an HTTPS endpoint that accepts `to`, `subject`,
   and `text` JSON (plus optional `html`) and sends the email.

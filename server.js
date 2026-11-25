@@ -140,7 +140,7 @@ const securityHeaders = {
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "strict-origin-when-cross-origin",
-  "Content-Security-Policy": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'",
+  "Content-Security-Policy": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'",
   "Permissions-Policy": "camera=(self), microphone=(), geolocation=()"
 };
 
@@ -590,7 +590,8 @@ export async function createApp({
   emailErrorLog = message => console.error(message),
   emailDomainCheck = hasMailRecords,
   corsAllowedOrigins = process.env.CORS_ALLOWED_ORIGINS || "",
-  skipMigrationCheck = false
+  skipMigrationCheck = false,
+  publicAppUrl = process.env.APP_BASE_URL || null
 } = {}) {
   if (process.env.NODE_ENV === "production" && !process.env.JWT_SECRET) throw new Error("JWT_SECRET must be configured in production.");
   if (process.env.NODE_ENV === "production" && Buffer.byteLength(jwtSecret) < 32) throw new Error("JWT_SECRET must contain at least 32 bytes in production.");
@@ -830,6 +831,9 @@ export async function createApp({
             ...corsHeaders
           });
           return response.end();
+        }
+        if (method === "GET" && url.pathname === "/api/config") {
+          return jsonResponse(response, 200, { publicAppUrl });
         }
         const retryAfter = getRateLimitRetryAfter(request, method, url.pathname, rateLimitBuckets);
         if (retryAfter) {

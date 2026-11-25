@@ -10,7 +10,7 @@ const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
 const clientScript = readFileSync(new URL("./app.js", import.meta.url), "utf8");
 const password = "A-secure-test-password-2026";
 
-async function setup(t) {
+async function setup(t, appOptions = {}) {
   const memoryDb = newDb({ autoCreateForeignKeyIndices: true });
   const { Pool: MemoryPool } = memoryDb.adapters.createPg();
   const pool = new MemoryPool();
@@ -25,7 +25,8 @@ async function setup(t) {
     pool,
     jwtSecret: "test-secret-with-enough-entropy-for-auth",
     skipMigrationCheck: true,
-    emailDomainCheck: async () => true
+    emailDomainCheck: async () => true,
+    ...appOptions
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -62,8 +63,15 @@ async function openPage(t, baseUrl, token = "", pageUrl = `${baseUrl}/`) {
     value: { getUserMedia: async () => ({ getTracks: () => [] }) }
   });
   Object.defineProperty(window.crypto, "randomUUID", { value: randomUUID });
+  let bannerObjectUrlId = 0;
+  window.URL.createObjectURL = () => `blob:gatherflow-${++bannerObjectUrlId}`;
+  window.URL.revokeObjectURL = () => {};
+  window.__fetchRequests = [];
   window.confirm = () => true;
-  window.fetch = (url, options) => fetch(new URL(url, baseUrl), options);
+  window.fetch = (url, options = {}) => {
+    window.__fetchRequests.push({ url: String(url), options });
+    return fetch(new URL(url, baseUrl), options);
+  };
   window.HTMLDialogElement.prototype.showModal = function showModal() { this.open = true; };
   window.HTMLDialogElement.prototype.close = function close() {
     this.open = false;
@@ -138,13 +146,17 @@ async function loginThroughUi(window, email, accountPassword = password) {
   await waitFor(() => window.document.querySelector("#eventCards .empty-state, #eventCards .event-card, #eventCards [data-status-event], #eventCards [data-join-volunteer]"));
 }
 
-async function createEventThroughUi(window, title) {
+async function createEventThroughUi(window, title, { startsAt, registrationStartAt, registrationEndAt, bannerData } = {}) {
   click(window, "#headerAction");
   const form = window.document.querySelector("#eventForm");
   setValue(window, '#eventForm [name="title"]', title);
   setValue(window, '#eventForm [name="description"]', "A test event created through the organizer workflow.");
   setValue(window, '#eventForm [name="location"]', "Community Hall");
   setValue(window, '#eventForm [name="capacity"]', "25");
+  if (startsAt) setValue(window, '#eventForm [name="startsAt"]', startsAt);
+  if (registrationStartAt) setValue(window, '#eventForm [name="registrationStartAt"]', registrationStartAt);
+  if (registrationEndAt) setValue(window, '#eventForm [name="registrationEndAt"]', registrationEndAt);
+  if (bannerData) form.dataset.bannerData = bannerData;
   submit(window, "#eventForm");
   await waitFor(() => [...window.document.querySelectorAll("#eventCards h2")].some(heading => heading.textContent === title));
   return window.document.querySelector("#eventCards [data-status-event]")?.dataset.statusEvent;
@@ -207,8 +219,34 @@ test("frontend event form creates and publishes an event", async t => {
   const email = `creator-${randomUUID()}@example.test`;
   const token = await registerAccountThroughUi(app, t, window, { name: "Event Creator", email });
   const title = `UI Event ${randomUUID()}`;
-  const eventId = await createEventThroughUi(window, title);
+  const startsAt = "2035-06-15T18:45";
+  const registrationStartAt = "2035-06-14T09:30";
+  const registrationEndAt = "2035-06-15T17:00";
+  const bannerData = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+  const eventId = await createEventThroughUi(window, title, {
+    startsAt,
+    registrationStartAt,
+    registrationEndAt,
+    bannerData
+  });
   assert.ok(eventId);
+  const createRequest = window.__fetchRequests.find(request =>
+    request.url === "/api/events" && request.options.method === "POST"
+  );
+  assert.ok(createRequest);
+  const submittedEvent = JSON.parse(createRequest.options.body);
+  assert.equal(submittedEvent.startsAt, new Date(startsAt).toISOString());
+  assert.equal(submittedEvent.registrationStartAt, new Date(registrationStartAt).toISOString());
+  assert.equal(submittedEvent.registrationEndAt, new Date(registrationEndAt).toISOString());
+  assert.equal(submittedEvent.bannerData, bannerData);
+  await waitFor(() => window.document.querySelector("#eventCards [data-event-banner]")?.src.startsWith("blob:gatherflow-"));
+  await waitFor(() => window.document.querySelector("#eventBanner [data-event-banner]")?.src.startsWith("blob:gatherflow-"));
+  const bannerRequest = window.__fetchRequests.find(request => request.url === `/api/events/${eventId}/banner`);
+  assert.ok(bannerRequest);
+  assert.equal(bannerRequest.options.headers.Authorization, `Bearer ${token}`);
+  click(window, `[data-edit-event="${eventId}"]`);
+  await waitFor(() => window.document.querySelector("#bannerPreview").src.startsWith("blob:gatherflow-"));
+  window.document.querySelector("#eventDialog").close();
   click(window, '[data-view="events"]');
   click(window, `[data-status-event="${eventId}"][data-event-status="PUBLISHED"]`);
   await waitFor(() => !window.document.querySelector(`[data-status-event="${eventId}"][data-event-status="PUBLISHED"]`));
@@ -217,6 +255,77 @@ test("frontend event form creates and publishes an event", async t => {
   assert.equal(saved.data.event.title, title);
   assert.equal(saved.data.event.status, "PUBLISHED");
   assert.equal(saved.data.event.location, "Community Hall");
+  assert.equal(new Date(saved.data.event.starts_at).toISOString(), new Date(startsAt).toISOString());
+  assert.equal(new Date(saved.data.event.registration_start_at).toISOString(), new Date(registrationStartAt).toISOString());
+  assert.equal(new Date(saved.data.event.registration_end_at).toISOString(), new Date(registrationEndAt).toISOString());
+  assert.ok(saved.data.event.bannerUrl);
+});
+
+test("event registration links use the configured public URL and warn for local-only URLs", async t => {
+  const publicApp = await setup(t, { publicAppUrl: "https://events.example.test" });
+  const organizer = await createAccount(publicApp, "Share Organizer", `share-${randomUUID()}@example.test`);
+  const event = await createPublishedEvent(publicApp, organizer.token, "Shareable event");
+  const window = await openPage(t, publicApp.baseUrl, organizer.token);
+  await waitFor(() => window.document.querySelector("#attendeeList .empty-state"));
+  const copiedLinks = [];
+  Object.defineProperty(window.navigator, "clipboard", {
+    value: { writeText: async link => copiedLinks.push(link) }
+  });
+
+  click(window, `[data-copy-event="${event.id}"]`);
+  await waitFor(() => copiedLinks.length);
+  assert.equal(copiedLinks[0], `https://events.example.test/?event=${event.id}`);
+  assert.equal(window.document.querySelector("#toast").textContent, "Registration link copied");
+
+  const localApp = await setup(t, { publicAppUrl: "http://localhost:3000" });
+  const localOrganizer = await createAccount(localApp, "Local Share Organizer", `local-share-${randomUUID()}@example.test`);
+  const localEvent = await createPublishedEvent(localApp, localOrganizer.token, "Local-only event");
+  const localWindow = await openPage(t, localApp.baseUrl, localOrganizer.token);
+  await waitFor(() => localWindow.document.querySelector("#attendeeList .empty-state"));
+  const localCopiedLinks = [];
+  Object.defineProperty(localWindow.navigator, "clipboard", {
+    value: { writeText: async link => localCopiedLinks.push(link) }
+  });
+
+  click(localWindow, `[data-copy-event="${localEvent.id}"]`);
+  await waitFor(() => localCopiedLinks.length);
+  assert.equal(new URL(localCopiedLinks[0]).hostname, "localhost");
+  assert.match(localWindow.document.querySelector("#toast").textContent, /local-only.*APP_BASE_URL/i);
+});
+
+test("signed-in attendees can register from the events view using their account details", async t => {
+  const app = await setup(t);
+  const organizer = await createAccount(app, "Registration Organizer", `register-owner-${randomUUID()}@example.test`);
+  const event = await createPublishedEvent(app, organizer.token, "Attendee self-registration");
+  const attendee = await createAccount(
+    app,
+    "Signed-in Attendee",
+    `register-attendee-${randomUUID()}@example.test`,
+    "ATTENDEE"
+  );
+  const window = await openPage(t, app.baseUrl);
+  await loginThroughUi(window, attendee.user.email);
+
+  const registerButton = await waitFor(() => window.document.querySelector(`[data-register="${event.id}"]`));
+  assert.equal(registerButton.disabled, false);
+  click(window, `[data-register="${event.id}"]`);
+  await waitFor(() => window.document.querySelector("#registrationDialog").open);
+  assert.equal(window.document.querySelector('#registrationForm [name="name"]').value, attendee.user.name);
+  assert.equal(window.document.querySelector('#registrationForm [name="email"]').value, attendee.user.email);
+  assert.equal(window.document.querySelector('#registrationForm [name="email"]').readOnly, true);
+
+  setValue(window, '#registrationForm [name="phone"]', "555-0404");
+  submit(window, "#registrationForm");
+  await waitFor(() => window.document.querySelector("#ticketDialog").open);
+  const ticketCode = window.document.querySelector(".ticket-card code").textContent;
+  const saved = await app.pool.query(`
+    SELECT COUNT(*) AS count
+    FROM registrations r
+    JOIN attendees a ON a.id=r.attendee_profile_id
+    JOIN tickets t ON t.registration_id=r.id
+    WHERE r.event_id=$1 AND a.email=$2 AND t.ticket_code=$3
+  `, [event.id, attendee.user.email, ticketCode]);
+  assert.equal(Number(saved.rows[0].count), 1);
 });
 
 test("frontend public registration displays a QR ticket backed by a stored registration", async t => {

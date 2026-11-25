@@ -21,6 +21,7 @@ let recoveryMode = false;
 let scannerControls = null;
 let ticketScanBusy = false;
 let emailVerificationToken = "";
+const eventBannerSources = new Map();
 
 function escapeHtml(value = "") {
   return String(value).replace(/[&<>"']/g, character => ({
@@ -82,6 +83,70 @@ async function api(path, options = {}) {
     throw error;
   }
   return result;
+}
+
+function isLocalOnlyUrl(url) {
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local") ||
+    hostname === "::1" || /^127\./.test(hostname) || /^10\./.test(hostname) ||
+    /^192\.168\./.test(hostname) || /^169\.254\./.test(hostname) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(hostname);
+}
+
+async function copyRegistrationLink(eventId) {
+  try {
+    const { publicAppUrl } = await api("/api/config");
+    const url = new URL("/", publicAppUrl || location.origin);
+    if (!["http:", "https:"].includes(url.protocol)) {
+      throw new Error("APP_BASE_URL must use HTTP or HTTPS.");
+    }
+    url.searchParams.set("event", eventId);
+    try {
+      await navigator.clipboard.writeText(url.toString());
+    } catch {
+      window.prompt("Copy this event registration link:", url.toString());
+    }
+    showToast(isLocalOnlyUrl(url)
+      ? "Link copied, but this address is local-only. Set APP_BASE_URL to a public address for outside visitors."
+      : "Registration link copied");
+  } catch (error) {
+    showToast(`Could not create registration link: ${error.message}`);
+  }
+}
+
+async function loadEventBannerImage(image, url) {
+  let source = eventBannerSources.get(url);
+  if (!source) {
+    const headers = sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {};
+    source = fetch(url, { headers })
+      .then(response => {
+        if (!response.ok) throw new Error(`Banner request failed with status ${response.status}.`);
+        return response.blob();
+      })
+      .then(blob => URL.createObjectURL(blob));
+    eventBannerSources.set(url, source);
+  }
+  try {
+    const objectUrl = await source;
+    if (image.isConnected && image.dataset.eventBanner === url) image.src = objectUrl;
+  } catch (error) {
+    if (eventBannerSources.get(url) === source) eventBannerSources.delete(url);
+    console.error(`Could not load event banner ${url}.`, error);
+    image.remove();
+  }
+}
+
+function loadEventBannerImages(root) {
+  $$("[data-event-banner]", root).forEach(image => {
+    loadEventBannerImage(image, image.dataset.eventBanner);
+  });
+}
+
+function clearEventBannerSources() {
+  for (const source of eventBannerSources.values()) {
+    source.then(objectUrl => URL.revokeObjectURL(objectUrl), () => {});
+  }
+  eventBannerSources.clear();
 }
 
 function setAuthMode(mode) {
@@ -274,7 +339,7 @@ function renderOverview() {
           <span class="event-status ${statusStyle(event.status)}">${escapeHtml(statusLabel(event.status))}</span>
           ${isVolunteer
             ? `<button class="primary" data-join-volunteer="${escapeHtml(event.id)}" ${event.isVolunteer || !event.canVolunteer ? "disabled" : ""}>${event.isVolunteer ? "You're volunteering" : event.canVolunteer ? "Join as volunteer" : "Sign-up closed"}</button>`
-            : `<button class="primary" data-register="${escapeHtml(event.id)}" ${event.canRegister ? "" : "disabled"}>${event.canRegister ? "Register" : statusLabel(event.status)}</button>`}
+            : `<button class="primary" data-register="${escapeHtml(event.id)}" ${event.canRegister ? "" : "disabled"}>${escapeHtml(registrationActionLabel(event))}</button>`}
         </article>`).join("")
       : `<div class="empty-state">${isVolunteer ? "No upcoming volunteer opportunities are available yet." : "No events are open for registration just yet."}</div>`;
     $("#shareEvent").classList.add("hidden");
@@ -291,9 +356,11 @@ function renderOverview() {
   } else {
     $("#greeting").textContent = `Welcome back, ${user.name.split(/\s+/)[0]}`;
     $("#eventBanner").innerHTML = `
+      ${currentEvent.bannerUrl ? `<img class="dashboard-event-banner" data-event-banner="${escapeHtml(currentEvent.bannerUrl)}" alt="Banner for ${escapeHtml(currentEvent.title)}" />` : ""}
       <div class="event-banner-copy"><span class="event-status ${statusStyle(currentEvent.status)}">${escapeHtml(statusLabel(currentEvent.status))}</span><h2>${escapeHtml(currentEvent.title)}</h2><p>${escapeHtml(currentEvent.description || "Bring your community together.")}</p>
         <div class="event-meta"><span>◷ ${escapeHtml(formatDate(currentEvent.starts_at))}</span><span>⌖ ${escapeHtml(currentEvent.location)}</span><span>♧ ${currentEvent.capacity} places</span></div></div>
       ${canManage ? `<button class="secondary volunteer-button" id="manageVolunteers">Manage volunteers</button>` : ""}`;
+    loadEventBannerImages($("#eventBanner"));
   }
   if (canManage) renderOrganizerDashboard();
 }
@@ -352,7 +419,7 @@ function renderEventCards() {
       : "Create events and share a link to register.";
   $("#eventCards").innerHTML = events.length
     ? events.map(event => `<article class="panel event-card">
-      ${event.bannerUrl ? `<img class="event-card-banner" src="${escapeHtml(event.bannerUrl)}" alt="" />` : ""}
+      ${event.bannerUrl ? `<img class="event-card-banner" data-event-banner="${escapeHtml(event.bannerUrl)}" alt="Banner for ${escapeHtml(event.title)}" />` : ""}
       <div class="event-card-top"><span class="event-status ${statusStyle(event.status)}">${escapeHtml(statusLabel(event.status))}</span><span class="event-card-capacity">${event.registered} / ${event.capacity} registered</span></div>
       <h2>${escapeHtml(event.title)}</h2><p>${escapeHtml(event.description || "No description yet.")}</p>
       <div class="event-meta"><span>◷ ${escapeHtml(formatDate(event.starts_at))}</span><span>⌖ ${escapeHtml(event.location)}</span>${event.registration_end_at ? `<span>Registration ends ${escapeHtml(formatDate(event.registration_end_at))}</span>` : ""}</div>
@@ -369,10 +436,11 @@ function renderEventCards() {
           ? `${event.isVolunteer
             ? `<button class="secondary" disabled>You're volunteering</button><button class="text-button danger-text" data-leave-volunteer="${escapeHtml(event.id)}">Leave team</button>`
             : `<button class="primary" data-join-volunteer="${escapeHtml(event.id)}" ${event.canVolunteer ? "" : "disabled"}>${event.canVolunteer ? "Join as volunteer" : "Sign-up closed"}</button>`}`
-          : `<button class="primary" data-register="${escapeHtml(event.id)}" ${event.canRegister ? "" : "disabled"}>${event.canRegister ? "Register" : statusLabel(event.status)}</button>`}
+          : `<button class="primary" data-register="${escapeHtml(event.id)}" ${event.canRegister ? "" : "disabled"}>${escapeHtml(registrationActionLabel(event))}</button>`}
         <button class="text-button" data-select-event="${escapeHtml(event.id)}">Open overview</button>
       </div></article>`).join("")
-    : `<div class="panel empty-state"><strong>${canManage ? "No events yet" : user.role === "VOLUNTEER" ? "No volunteer opportunities yet" : "No events available"}</strong><span>${canManage ? "Create your first event to get started." : user.role === "VOLUNTEER" ? "Upcoming events will appear here when organizers publish them." : "Check back when organizers publish upcoming events."}</span>${canManage ? `<button class="primary" data-create-event>Create your first event</button>` : ""}</div>`;
+    : `<div class="panel empty-state"><strong>${canManage ? "No events yet" : user.role === "VOLUNTEER" ? "No volunteer opportunities yet" : "No published events yet"}</strong><span>${canManage ? "Create your first event to get started." : user.role === "VOLUNTEER" ? "Upcoming events will appear here when organizers publish them." : "Organizers must publish an event before attendees can register."}</span>${canManage ? `<button class="primary" data-create-event>Create your first event</button>` : ""}</div>`;
+  loadEventBannerImages($("#eventCards"));
 }
 
 function statusLabel(status) {
@@ -383,6 +451,17 @@ function statusLabel(status) {
     COMPLETED: "Completed",
     CANCELLED: "Cancelled"
   })[status] || status;
+}
+
+function registrationActionLabel(event, availableLabel = "Register") {
+  if (event.canRegister) return availableLabel;
+  if (event.registered >= event.capacity) return "Event full";
+  if (event.registration_start_at && new Date(event.registration_start_at).getTime() > Date.now()) {
+    return `Opens ${formatDate(event.registration_start_at)}`;
+  }
+  if (event.status === "REGISTRATION_CLOSED") return "Registration closed";
+  if (new Date(event.starts_at).getTime() <= Date.now()) return "Event started";
+  return statusLabel(event.status);
 }
 
 function statusStyle(status) {
@@ -622,6 +701,10 @@ function readQuestionAnswers(container) {
 function openRegistration(event) {
   currentRegistrationEvent = event;
   $("#registrationForm").reset();
+  const isSignedInAttendee = sessionToken && user?.role === "ATTENDEE";
+  $("#registrationForm [name='name']").value = isSignedInAttendee ? user.name : "";
+  $("#registrationForm [name='email']").value = isSignedInAttendee ? user.email : "";
+  $("#registrationForm [name='email']").readOnly = Boolean(isSignedInAttendee);
   $("#guestFields").replaceChildren();
   $("#registrationTitle").textContent = `Register for ${event.title}`;
   $("#registrationDescription").textContent = `${formatDate(event.starts_at)} · ${event.location} · ${Math.max(0, event.capacity - event.registered)} places remaining`;
@@ -646,7 +729,7 @@ function showPublicLanding(event) {
   $("#landingDescription").textContent = event.description || "Join us for a community gathering.";
   $("#landingMeta").innerHTML = `${event.bannerUrl ? `<img class="landing-banner" src="${escapeHtml(event.bannerUrl)}" alt="" />` : ""}<span>◷ ${escapeHtml(formatDate(event.starts_at))}</span><span>⌖ ${escapeHtml(event.location)}</span><span>♧ ${Math.max(0, event.capacity - event.registered)} places remaining</span>${event.registration_start_at ? `<span>Registration opens ${escapeHtml(formatDate(event.registration_start_at))}</span>` : ""}${event.registration_end_at ? `<span>Registration closes ${escapeHtml(formatDate(event.registration_end_at))}</span>` : ""}`;
   $("#landingRegister").disabled = !event.canRegister;
-  $("#landingRegister").textContent = event.canRegister ? "Register for this event" : statusLabel(event.status);
+  $("#landingRegister").textContent = registrationActionLabel(event, "Register for this event");
 }
 
 function showTicketConfirmation(result, allowCancellations) {
@@ -673,6 +756,8 @@ function openEventDialog() {
   form.querySelector('[type="submit"]').textContent = "Create event";
   $("#questionEditor").replaceChildren();
   $("#bannerPreviewWrap").classList.add("hidden");
+  $("#bannerPreview").removeAttribute("src");
+  delete $("#bannerPreview").dataset.eventBanner;
   const localDate = dateTimeInputValue(new Date(Date.now() + 24 * 60 * 60 * 1000));
   form.elements.startsAt.value = localDate;
   form.elements.startsAt.min = dateTimeInputValue(new Date());
@@ -682,6 +767,12 @@ function openEventDialog() {
 function dateTimeInputValue(value) {
   const date = new Date(value);
   return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+}
+
+function dateTimeInputToIso(value) {
+  if (!value) return value;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toISOString();
 }
 
 function editEvent(event) {
@@ -695,6 +786,8 @@ function editEvent(event) {
   $("#eventDialogTitle").textContent = "Edit event";
   form.querySelector('[type="submit"]').textContent = "Save changes";
   form.elements.startsAt.min = "";
+  $("#bannerPreview").removeAttribute("src");
+  delete $("#bannerPreview").dataset.eventBanner;
   form.elements.title.value = event.title;
   form.elements.description.value = event.description || "";
   form.elements.startsAt.value = dateTimeInputValue(event.starts_at);
@@ -706,7 +799,8 @@ function editEvent(event) {
   form.elements.allowCancellations.checked = event.allow_cancellations;
   $("#questionEditor").innerHTML = (event.questions || []).map(questionEditorRow).join("");
   if (event.bannerUrl) {
-    $("#bannerPreview").src = event.bannerUrl;
+    $("#bannerPreview").dataset.eventBanner = event.bannerUrl;
+    loadEventBannerImage($("#bannerPreview"), event.bannerUrl);
     $("#bannerPreviewWrap").classList.remove("hidden");
   } else {
     $("#bannerPreviewWrap").classList.add("hidden");
@@ -807,6 +901,8 @@ async function syncOfflineCheckins() {
 async function signOut() {
   stopQrScanner();
   clearInterval(dashboardRefreshTimer);
+  clearEventBannerSources();
+  $("#appShell").querySelectorAll("[data-event-banner]").forEach(image => image.removeAttribute("src"));
   localStorage.removeItem(tokenKey);
   sessionToken = "";
   user = null;
@@ -987,13 +1083,7 @@ $$(".nav-item[data-view]").forEach(button => button.addEventListener("click", ()
 $$("[data-go]").forEach(button => button.addEventListener("click", () => selectView(button.dataset.go)));
 $("#shareEvent").addEventListener("click", async () => {
   if (!currentEvent) return;
-  const url = `${location.origin}/?event=${encodeURIComponent(currentEvent.id)}`;
-  try {
-    await navigator.clipboard.writeText(url);
-    showToast("Registration link copied");
-  } catch {
-    window.prompt("Copy this event registration link:", url);
-  }
+  await copyRegistrationLink(currentEvent.id);
 });
 $("#addAttendee").addEventListener("click", () => {
   if (!currentEvent) return showToast("Create an event before adding attendees.");
@@ -1069,6 +1159,9 @@ $("#eventForm").addEventListener("submit", async event => {
   try {
     const values = Object.fromEntries(new FormData(form));
     delete values.banner;
+  for (const name of ["startsAt", "registrationStartAt", "registrationEndAt"]) {
+    values[name] = dateTimeInputToIso(values[name]);
+  }
     values.capacity = Number(values.capacity);
     values.allowCancellations = form.elements.allowCancellations.checked;
     values.questions = $$("[data-question-row]", $("#questionEditor")).map(row => {
@@ -1089,6 +1182,7 @@ $("#eventForm").addEventListener("submit", async event => {
       ? await api(`/api/events/${editingEvent.id}`, { method: "PATCH", body: JSON.stringify(values) })
       : await api("/api/events", { method: "POST", body: JSON.stringify(values) });
     form.closest("dialog").close();
+    clearEventBannerSources();
     currentEvent = result.event;
     await refreshWorkspace();
     selectView("overview");
@@ -1121,6 +1215,8 @@ $("#removeBanner").addEventListener("click", () => {
   $("#eventForm").dataset.bannerData = "";
   $("#eventForm").dataset.removeBanner = "true";
   $("#bannerInput").value = "";
+  $("#bannerPreview").removeAttribute("src");
+  delete $("#bannerPreview").dataset.eventBanner;
   $("#bannerPreviewWrap").classList.add("hidden");
 });
 $("#addQuestion").addEventListener("click", () => {
@@ -1297,13 +1393,7 @@ $("#eventCards").addEventListener("click", async event => {
   if (copy) {
     const chosen = events.find(item => item.id === copy.dataset.copyEvent);
     if (!chosen) return;
-    const url = `${location.origin}/?event=${encodeURIComponent(chosen.id)}`;
-    try {
-      await navigator.clipboard.writeText(url);
-      showToast("Registration link copied");
-    } catch {
-      window.prompt("Copy this event registration link:", url);
-    }
+    await copyRegistrationLink(chosen.id);
   }
   const select = event.target.closest("[data-select-event]");
   if (select) {

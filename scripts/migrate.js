@@ -7,16 +7,21 @@ const root = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const databaseUrl = process.env.DATABASE_URL
   ? new URL(process.env.DATABASE_URL)
   : null;
-const host = databaseUrl?.hostname || process.env.PGHOST || "localhost";
-const port = databaseUrl?.port || process.env.PGPORT || "5432";
+const host = databaseUrl?.hostname || process.env.PGHOST || "127.0.0.1";
+const port = databaseUrl?.port || process.env.PGPORT ||
+  (databaseUrl ? "5432" : process.env.POSTGRES_PORT || "5433");
 const database = databaseUrl?.pathname.slice(1) || process.env.PGDATABASE || "gatherflow";
 const user = databaseUrl?.username
   ? decodeURIComponent(databaseUrl.username)
   : process.env.PGUSER || "gatherflow";
 const password = databaseUrl?.password
   ? decodeURIComponent(databaseUrl.password)
-  : process.env.PGPASSWORD || "Harshith@07";
+  : process.env.PGPASSWORD || process.env.POSTGRES_PASSWORD;
 const query = databaseUrl?.search || "";
+if (!password) {
+  console.error("Set PGPASSWORD or POSTGRES_PASSWORD, or include a password in DATABASE_URL.");
+  process.exit(1);
+}
 const flywayArgs = [
   "-baselineOnMigrate=true",
   "-baselineVersion=2",

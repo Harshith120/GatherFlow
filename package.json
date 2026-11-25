@@ -5,9 +5,9 @@
   "type": "module",
   "description": "Event registration and attendee management",
   "scripts": {
-    "start": "node scripts/migrate.js && node server.js",
-    "serve": "node server.js",
-    "db:migrate": "node scripts/migrate.js",
+    "start": "node --env-file-if-exists=.env scripts/start.js",
+    "serve": "node --env-file-if-exists=.env scripts/start.js --serve",
+    "db:migrate": "node --env-file-if-exists=.env scripts/migrate.js",
     "test": "node --test",
     "test:frontend": "node --test ./frontend.test.js",
     "test:postgres-e2e": "node --test ./postgres.e2e.test.js"
